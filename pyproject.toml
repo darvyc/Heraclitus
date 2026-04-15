@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "heraclitus"
+version = "0.1.0"
+description = "A 3D Dual-Flow Transformer with forward-pass learning, directional alignment, and Counter-Flow shadow networks."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+authors = [{ name = "The Heraclitus Authors" }]
+keywords = ["transformer", "dual-flow", "counter-flow", "neural-networks", "3d", "hebbian"]
+dependencies = [
+    "torch>=2.0",
+    "numpy>=1.22",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "pytest-cov"]
+
+[tool.setuptools.packages.find]
+include = ["heraclitus*"]
+exclude = ["tests*", "examples*", "docs*"]
