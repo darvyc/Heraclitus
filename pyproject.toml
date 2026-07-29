@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "heraclitus"
-version = "2.0.0"
-description = "A multimodal predictive-state transformer parameter with stable higher-dimensional dynamics and low-rank correlated uncertainty."
+version = "1.0.0"
+description = "A bounded recurrent memory adapter for transformer hidden states."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.9"
@@ -15,15 +15,13 @@ keywords = [
     "large-language-model",
     "llm",
     "adapter",
-    "predictive-state",
-    "state-space",
-    "mixture-model",
-    "woodbury-identity",
-    "householder",
+    "recurrent-memory",
+    "streaming-inference",
+    "context-compression",
     "pytorch",
 ]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
@@ -51,7 +49,7 @@ Issues = "https://github.com/darvyc/Heraclitus/issues"
 
 [tool.setuptools.packages.find]
 include = ["heraclitus*"]
-exclude = ["tests*", "examples*", "docs*"]
+exclude = ["tests*", "examples*", "docs*", "benchmarks*"]
 
 [tool.setuptools.package-data]
 heraclitus = ["py.typed"]
