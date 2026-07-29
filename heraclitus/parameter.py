@@ -1,4 +1,4 @@
-"""Heraclitus 1.0: a causal predictive low-rank transformer parameter."""
+"""Heraclitus 2.0: multimodal higher-dimensional predictive state."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -18,10 +18,20 @@ class HeraclitusDiagnostics:
     surprise_mean: Tensor
     residual_ratio: Tensor
     posterior_variance: Tensor
-    shadow_entropy: Tensor
-    effective_shadows: Tensor
-    best_shadow_probability: Tensor
-    next_best_shadow_probability: Tensor
+    mode_entropy: Tensor
+    effective_modes: Tensor
+    best_mode_probability: Tensor
+    next_best_mode_probability: Tensor
+    mode_separation: Tensor
+    latent_standard_deviation: Tensor
+
+    @property
+    def shadow_entropy(self) -> Tensor:
+        return self.mode_entropy
+
+    @property
+    def effective_shadows(self) -> Tensor:
+        return self.effective_modes
 
 
 @dataclass(frozen=True)
@@ -37,123 +47,162 @@ class HeraclitusOutput:
         diversity_weight: float = 1e-4,
         orthogonality_weight: float = 1e-4,
         residual_weight: float = 1e-4,
+        information_weight: float = 1e-4,
+        calibration_weight: float = 1e-4,
     ) -> Tensor:
-        """Return the weighted auxiliary objective used during training."""
         return (
             predictive_weight * self.regularization["predictive_nll"]
-            + diversity_weight * self.regularization["shadow_collapse"]
+            + diversity_weight * self.regularization["mode_collapse"]
             + orthogonality_weight * self.regularization["orthogonality"]
             + residual_weight * self.regularization["residual_energy"]
+            + information_weight * self.regularization["information_floor"]
+            + calibration_weight * self.regularization["calibration"]
         )
 
 
 class HeraclitusParameter(nn.Module):
-    """Maintain predictive latent state and write bounded innovation to an LLM.
+    """Maintain persistent mode-specific state and bounded predictive innovation.
 
-    The module is causal and batch-isolated. A contractive diagonal transition
-    predicts a latent observation. Context-conditioned Gaussian shadows retain
-    several plausible local futures. Evidence updates their probabilities, a
-    diagonal uncertainty filter corrects the state, and only normalised
-    prediction error is reconstructed into the transformer residual stream.
+    Each mode owns its own mean, diagonal covariance and low-rank covariance
+    factor. A product of learned Householder reflections supplies norm-preserving
+    cross-coordinate dynamics; context-dependent contraction keeps the spectral
+    radius below one. Likelihoods use the Woodbury identity, avoiding dense
+    state-size covariance inversion.
     """
 
     def __init__(self, config: HeraclitusConfig):
         super().__init__()
         self.config = config
-        d, r, k = config.hidden_size, config.state_size, config.num_shadows
+        d, r, k, c = (
+            config.hidden_size,
+            config.state_size,
+            config.num_modes,
+            config.covariance_rank,
+        )
 
         projection = torch.empty(d, r)
         nn.init.orthogonal_(projection)
         self.projection = nn.Parameter(projection)
-
         reconstruction = torch.empty(r, d)
         nn.init.normal_(reconstruction, mean=0.0, std=1e-3 / r**0.5)
         self.reconstruction = nn.Parameter(reconstruction)
 
-        self.initial_mean = nn.Parameter(torch.zeros(r))
-        self.retention_logits = nn.Parameter(torch.zeros(r))
-        self.process_noise_logits = nn.Parameter(torch.full((r,), -4.0))
+        self.initial_mode_means = nn.Parameter(torch.zeros(k, r))
+        nn.init.normal_(self.initial_mode_means, std=0.02)
+        self.transition_vectors = nn.Parameter(torch.randn(config.transition_reflections, r))
+        self.retention_logits = nn.Parameter(torch.zeros(k, r))
+        self.retention_context = nn.Parameter(torch.zeros(r, k * r))
+
+        self.process_noise_logits = nn.Parameter(torch.full((k, r), -4.0))
         self.observation_noise_logits = nn.Parameter(torch.full((r,), -2.0))
+        self.noise_context = nn.Parameter(torch.zeros(r, 2 * r))
+        self.process_factors = nn.Parameter(torch.zeros(k, r, c))
+        if c:
+            nn.init.normal_(self.process_factors, std=config.covariance_factor_scale / r**0.5)
 
-        offsets = torch.randn(k, r)
-        offsets = offsets - offsets.mean(dim=0, keepdim=True)
-        offsets = offsets / offsets.square().mean(dim=-1, keepdim=True).sqrt().clamp_min(
-            config.epsilon
-        )
-        self.shadow_offsets = nn.Parameter(offsets)
-        self.shadow_context = nn.Parameter(torch.zeros(r, k * r))
-        self.shadow_prior_logits = nn.Parameter(torch.zeros(k))
-
+        self.mode_prior_logits = nn.Parameter(torch.zeros(k))
         self.residual_scale_logit = nn.Parameter(torch.tensor(-2.0))
-        self.surprise_gate_bias = nn.Parameter(torch.tensor(-1.0))
-        self.surprise_gate_scale = nn.Parameter(torch.tensor(1.0))
+        self.novelty_gate_bias = nn.Parameter(torch.tensor(-1.0))
+        self.novelty_gate_scale = nn.Parameter(torch.tensor(1.0))
+        self.reliability_gate_scale = nn.Parameter(torch.tensor(1.0))
         self.dropout = nn.Dropout(config.dropout)
 
     def effective_projection(self) -> Tensor:
         return bounded_frobenius(
-            self.projection.float(),
-            self.config.projection_norm_bound,
-            self.config.epsilon,
+            self.projection.float(), self.config.projection_norm_bound, self.config.epsilon
         )
 
     def effective_reconstruction(self) -> Tensor:
         return bounded_frobenius(
-            self.reconstruction.float(),
-            self.config.reconstruction_norm_bound,
-            self.config.epsilon,
+            self.reconstruction.float(), self.config.reconstruction_norm_bound, self.config.epsilon
         )
 
-    def retention(self) -> Tensor:
+    def transition_basis(self) -> Tensor:
+        return self.transition_vectors.float() / self.transition_vectors.float().norm(
+            dim=-1, keepdim=True
+        ).clamp_min(self.config.epsilon)
+
+    def _apply_orthogonal_transition(self, values: Tensor) -> Tensor:
+        """Apply a product of Householder reflections along the state axis."""
+        result = values
+        state_axis = -1 if values.ndim == 3 else -2
+        for vector in self.transition_basis():
+            if state_axis == -1:
+                coefficient = (result * vector).sum(dim=-1, keepdim=True)
+                result = result - 2.0 * coefficient * vector
+            else:
+                coefficient = (result * vector.view(1, 1, -1, 1)).sum(
+                    dim=-2, keepdim=True
+                )
+                result = result - 2.0 * coefficient * vector.view(1, 1, -1, 1)
+        return result
+
+    def _retention(self, context: Tensor) -> Tensor:
+        b, k, r = context.shape
+        contextual = torch.tanh(context.mean(dim=1) @ self.retention_context.float()).view(b, k, r)
+        logits = self.retention_logits.float().unsqueeze(0) + contextual
         span = self.config.max_retention - self.config.min_retention
-        return self.config.min_retention + span * torch.sigmoid(
-            self.retention_logits.float()
-        )
+        return self.config.min_retention + span * torch.sigmoid(logits)
 
-    def process_noise(self) -> Tensor:
-        return self.config.process_noise_floor + torch.nn.functional.softplus(
-            self.process_noise_logits.float()
+    def _noise(self, context: Tensor) -> Tuple[Tensor, Tensor]:
+        b, k, r = context.shape
+        summary = context.mean(dim=1)
+        contextual = torch.tanh(summary @ self.noise_context.float())
+        process_context, observation_context = contextual.chunk(2, dim=-1)
+        q = self.config.process_noise_floor + torch.nn.functional.softplus(
+            self.process_noise_logits.float().unsqueeze(0)
+            + self.config.context_noise_scale * process_context[:, None, :]
         )
-
-    def observation_noise(self) -> Tensor:
-        return self.config.observation_noise_floor + torch.nn.functional.softplus(
-            self.observation_noise_logits.float()
+        obs = self.config.observation_noise_floor + torch.nn.functional.softplus(
+            self.observation_noise_logits.float().unsqueeze(0)
+            + self.config.context_noise_scale * observation_context
         )
+        return q, obs
 
     def initial_state(
-        self,
-        batch_size: int,
-        device: Optional[torch.device] = None,
+        self, batch_size: int, device: Optional[torch.device] = None
     ) -> HeraclitusState:
         if batch_size < 1:
             raise ValueError("batch_size must be positive")
-        target = device if device is not None else self.initial_mean.device
-        mean = self.initial_mean.float().to(target).unsqueeze(0).expand(batch_size, -1).clone()
-        variance = torch.full_like(mean, self.config.initial_variance)
-        log_weights = torch.log_softmax(self.shadow_prior_logits.float(), dim=0)
-        log_weights = log_weights.to(target).unsqueeze(0).expand(batch_size, -1).clone()
+        target = self.initial_mode_means.device if device is None else device
+        k, r, c = self.config.num_modes, self.config.state_size, self.config.covariance_rank
+        means = self.initial_mode_means.float().to(target).unsqueeze(0).expand(batch_size, -1, -1).clone()
+        variances = torch.full_like(means, self.config.initial_variance)
+        factors = torch.zeros(batch_size, k, r, c, device=target, dtype=torch.float32)
+        weights = torch.log_softmax(self.mode_prior_logits.float(), dim=0)
+        weights = weights.to(target).unsqueeze(0).expand(batch_size, -1).clone()
         steps = torch.zeros(batch_size, dtype=torch.long, device=target)
-        return HeraclitusState(mean, variance, log_weights, steps)
+        return HeraclitusState(means, variances, factors, weights, steps)
 
     def predictive_distribution(self, state: HeraclitusState) -> Tuple[Tensor, Tensor, Tensor]:
-        """Return one-step shadow means, diagonal variance, and prior probabilities."""
-        batch_size = state.mean.shape[0]
-        state.validate(batch_size, self.config.state_size, self.config.num_shadows)
-        mean = state.mean.float()
-        variance = state.variance.float().clamp_min(self.config.epsilon)
-        a = self.retention().unsqueeze(0)
-        prior_mean = a * mean
-        prior_variance = (a.square() * variance + self.process_noise().unsqueeze(0)).clamp_min(
+        state.validate(
+            state.mode_means.shape[0],
+            self.config.state_size,
+            self.config.num_modes,
+            self.config.covariance_rank,
+        )
+        prior = self._predict(state)
+        total_variance = prior.mode_variances + prior.covariance_factors.square().sum(dim=-1)
+        return prior.mode_means, total_variance, prior.mode_log_weights.exp()
+
+    def _predict(self, state: HeraclitusState) -> HeraclitusState:
+        rotated_means = self._apply_orthogonal_transition(state.mode_means.float())
+        retention = self._retention(rotated_means)
+        prior_means = retention * rotated_means
+        q, _ = self._noise(prior_means)
+        prior_variances = (retention.square() * state.mode_variances.float() + q).clamp_min(
             self.config.epsilon
         )
-        shadow_means = self._shadow_means(prior_mean, prior_variance)
-        prior_log_weights = self._prior_log_weights(state.shadow_log_weights.float())
-        return shadow_means, prior_variance, prior_log_weights.exp()
+        factors = self._apply_orthogonal_transition(state.covariance_factors.float())
+        factors = retention.unsqueeze(-1) * factors
+        if self.config.covariance_rank:
+            factors = factors + self.process_factors.float().unsqueeze(0)
+        learned = torch.log_softmax(self.mode_prior_logits.float(), dim=0).unsqueeze(0)
+        memory = self.config.mode_weight_memory
+        weights = torch.log_softmax(memory * state.mode_log_weights.float() + (1.0 - memory) * learned, dim=-1)
+        return HeraclitusState(prior_means, prior_variances, factors, weights, state.steps)
 
-    def forward(
-        self,
-        hidden_states: Tensor,
-        attention_mask: Optional[Tensor] = None,
-    ) -> Tensor:
+    def forward(self, hidden_states: Tensor, attention_mask: Optional[Tensor] = None) -> Tensor:
         return self.forward_with_state(hidden_states, None, attention_mask).hidden_states
 
     def forward_with_state(
@@ -166,181 +215,198 @@ class HeraclitusParameter(nn.Module):
         if hidden_states.ndim != 3:
             raise ValueError("hidden_states must have shape (batch, sequence, hidden)")
         b, t, d = hidden_states.shape
-        if d != self.config.hidden_size:
-            raise ValueError(f"expected hidden size {self.config.hidden_size}, got {d}")
-        if t < 1:
-            raise ValueError("sequence length must be positive")
-
+        if d != self.config.hidden_size or t < 1:
+            raise ValueError("hidden size mismatch or empty sequence")
         mask = self._normalise_mask(attention_mask, b, t, hidden_states.device)
-        runtime = state or self.initial_state(b, hidden_states.device)
-        runtime.validate(b, self.config.state_size, self.config.num_shadows)
-        if runtime.mean.device != hidden_states.device:
+        runtime = self.initial_state(b, hidden_states.device) if state is None else state
+        if runtime.mode_means.device != hidden_states.device:
             runtime = runtime.to(device=hidden_states.device)
+        runtime.validate(b, self.config.state_size, self.config.num_modes, self.config.covariance_rank)
 
         x = hidden_states.float()
-        rms = x.square().mean(dim=-1, keepdim=True).add(self.config.epsilon).sqrt()
-        latent = (x / rms) @ self.effective_projection()
+        normalised = x / x.square().mean(dim=-1, keepdim=True).add(self.config.epsilon).sqrt()
+        latent = normalised @ self.effective_projection()
         reconstruction = self.effective_reconstruction()
-
-        mean = runtime.mean.float()
-        variance = runtime.variance.float().clamp_min(self.config.epsilon)
-        shadow_log_weights = runtime.shadow_log_weights.float()
-        steps = runtime.steps
-
-        a = self.retention().unsqueeze(0)
-        q = self.process_noise().unsqueeze(0)
-        obs_noise = self.observation_noise().unsqueeze(0)
-        residual_scale = self.config.max_residual_scale * torch.sigmoid(
-            self.residual_scale_logit.float()
-        )
+        residual_scale = self.config.max_residual_scale * torch.sigmoid(self.residual_scale_logit.float())
 
         deltas = []
         nlls = []
-        collapse_terms = []
-        innovation_terms = []
-        surprise_terms = []
         entropy_terms = []
+        separation_terms = []
+        surprise_terms = []
+        innovation_terms = []
+        calibration_terms = []
         best_terms = []
         second_terms = []
-        log_two_pi = latent.new_tensor(1.8378770664093453)
 
         for token_index in range(t):
-            valid = mask[:, token_index].unsqueeze(-1)
+            valid = mask[:, token_index].view(b, 1)
             z = latent[:, token_index, :]
-
-            prior_mean = a * mean
-            prior_variance = (a.square() * variance + q).clamp_min(self.config.epsilon)
-            shadow_means = self._shadow_means(prior_mean, prior_variance)
-            predictive_variance = (prior_variance + obs_noise).unsqueeze(1)
-            prior_log_weights = self._prior_log_weights(shadow_log_weights)
-
-            error_by_shadow = z.unsqueeze(1) - shadow_means
-            component_nll = 0.5 * (
-                error_by_shadow.square() / predictive_variance
-                + predictive_variance.log()
-                + log_two_pi
-            ).sum(dim=-1)
-            component_log_prob = prior_log_weights - component_nll
+            prior = self._predict(runtime)
+            _, observation_noise = self._noise(prior.mode_means)
+            error = z[:, None, :] - prior.mode_means
+            log_likelihood, solved = self._low_rank_gaussian(error, prior, observation_noise)
+            component_log_prob = prior.mode_log_weights + log_likelihood
             mixture_log_prob = torch.logsumexp(component_log_prob, dim=-1)
-            raw_posterior = torch.softmax(component_log_prob, dim=-1)
-            floor = self.config.min_shadow_probability
-            posterior_weights = raw_posterior * (1.0 - floor * self.config.num_shadows) + floor
+            raw_weights = torch.softmax(component_log_prob, dim=-1)
+            floor = self.config.min_mode_probability
+            posterior_weights = raw_weights * (1.0 - floor * self.config.num_modes) + floor
             posterior_log_weights = posterior_weights.log()
 
-            predicted_mean = (posterior_weights.unsqueeze(-1) * shadow_means).sum(dim=1)
-            innovation = z - predicted_mean
-            gain = prior_variance / (prior_variance + obs_noise)
-            posterior_mean = predicted_mean + gain * innovation
-
-            between_shadow_variance = (
-                posterior_weights.unsqueeze(-1)
-                * (shadow_means - predicted_mean.unsqueeze(1)).square()
-            ).sum(dim=1)
-            posterior_variance = (
-                (1.0 - gain) * prior_variance + between_shadow_variance
-            ).clamp_min(self.config.epsilon)
-
-            surprise = (
-                innovation.square() / (prior_variance + obs_noise)
-            ).mean(dim=-1, keepdim=True)
-            gate = torch.sigmoid(
-                self.surprise_gate_bias.float()
-                + torch.nn.functional.softplus(self.surprise_gate_scale.float())
-                * surprise.sqrt()
+            factor_projection = torch.einsum("bkrc,bkr->bkc", prior.covariance_factors, solved)
+            correction = prior.mode_variances * solved + torch.einsum(
+                "bkrc,bkc->bkr", prior.covariance_factors, factor_projection
             )
-            whitened_innovation = innovation / (prior_variance + obs_noise).sqrt()
-            token_delta = residual_scale * gate * (whitened_innovation @ reconstruction)
+            posterior_means = prior.mode_means + correction
+            total_prior_variance = prior.mode_variances + prior.covariance_factors.square().sum(dim=-1)
+            gain = total_prior_variance / (total_prior_variance + observation_noise[:, None, :])
+            posterior_variances = (
+                (1.0 - gain) * prior.mode_variances
+            ).clamp_min(self.config.epsilon)
+            posterior_factors = prior.covariance_factors * (1.0 - gain).sqrt().unsqueeze(-1)
+
+            mixture_prior = (posterior_weights[:, :, None] * prior.mode_means).sum(dim=1)
+            innovation = z - mixture_prior
+            within = total_prior_variance
+            between = (prior.mode_means - mixture_prior[:, None, :]).square()
+            mixture_variance = (
+                posterior_weights[:, :, None] * (within + between)
+            ).sum(dim=1).clamp_min(self.config.epsilon)
+            surprise = (innovation.square() / (mixture_variance + observation_noise)).mean(
+                dim=-1, keepdim=True
+            )
+            entropy = -(posterior_weights * posterior_log_weights).sum(dim=-1, keepdim=True)
+            reliability = torch.exp(-torch.nn.functional.softplus(self.reliability_gate_scale.float()) * mixture_variance.mean(dim=-1, keepdim=True).sqrt())
+            novelty = torch.sigmoid(
+                self.novelty_gate_bias.float()
+                + torch.nn.functional.softplus(self.novelty_gate_scale.float()) * surprise.sqrt()
+            )
+            gate = novelty * reliability
+            whitened = innovation / (mixture_variance + observation_noise).sqrt()
+            token_delta = residual_scale * gate * (whitened @ reconstruction)
             token_delta = self.dropout(token_delta)
             token_delta = torch.where(valid, token_delta, torch.zeros_like(token_delta))
             deltas.append(token_delta)
 
-            entropy = -(posterior_weights * posterior_log_weights).sum(dim=-1, keepdim=True)
+            pairwise = torch.cdist(posterior_means, posterior_means, p=2)
+            eye = torch.eye(self.config.num_modes, dtype=torch.bool, device=x.device)
+            off_diagonal = pairwise.masked_select(~eye.unsqueeze(0)).view(b, -1)
+            separation = off_diagonal.square().mean(dim=-1, keepdim=True)
             sorted_weights = posterior_weights.sort(dim=-1, descending=True).values
             best_terms.append(torch.where(valid, sorted_weights[:, :1], torch.zeros_like(valid)))
             second_terms.append(torch.where(valid, sorted_weights[:, 1:2], torch.zeros_like(valid)))
             entropy_terms.append(torch.where(valid, entropy, torch.zeros_like(entropy)))
-            nlls.append(
-                torch.where(valid.squeeze(-1), -mixture_log_prob, torch.zeros_like(mixture_log_prob))
-            )
-            pairwise = torch.cdist(shadow_means, shadow_means, p=2)
-            eye = torch.eye(self.config.num_shadows, device=pairwise.device, dtype=torch.bool)
-            off_diagonal = pairwise.masked_select(~eye.unsqueeze(0)).view(b, -1)
-            collapse_terms.append(torch.exp(-off_diagonal.square().mean(dim=-1)).mean())
-            innovation_terms.append(
-                torch.where(
-                    valid,
-                    innovation.square().mean(dim=-1, keepdim=True).sqrt(),
-                    torch.zeros_like(valid, dtype=x.dtype),
-                )
-            )
+            separation_terms.append(torch.where(valid, separation, torch.zeros_like(separation)))
             surprise_terms.append(torch.where(valid, surprise, torch.zeros_like(surprise)))
+            innovation_terms.append(torch.where(valid, innovation.square().mean(dim=-1, keepdim=True).sqrt(), torch.zeros_like(valid, dtype=x.dtype)))
+            expected_sq_error = (posterior_weights[:, :, None] * error.square()).sum(dim=(1, 2), keepdim=False) / self.config.state_size
+            predicted_error = (mixture_variance + observation_noise).mean(dim=-1)
+            calibration_terms.append(torch.where(valid.squeeze(-1), (expected_sq_error - predicted_error).square(), torch.zeros_like(predicted_error)))
+            nlls.append(torch.where(valid.squeeze(-1), -mixture_log_prob, torch.zeros_like(mixture_log_prob)))
 
-            mean = torch.where(valid, posterior_mean, mean)
-            variance = torch.where(valid, posterior_variance, variance)
-            shadow_log_weights = torch.where(valid, posterior_log_weights, shadow_log_weights)
-            steps = steps + valid.squeeze(-1).to(torch.long)
+            next_state = HeraclitusState(
+                posterior_means,
+                posterior_variances,
+                posterior_factors,
+                posterior_log_weights,
+                runtime.steps + valid.squeeze(-1).long(),
+            )
+            runtime = self._masked_state(runtime, next_state, valid)
 
         delta = torch.stack(deltas, dim=1)
         output = hidden_states + delta.to(hidden_states.dtype)
-        valid_count = mask.sum().clamp_min(1).to(torch.float32)
-        predictive_nll = torch.stack(nlls, dim=1).sum() / valid_count
-        shadow_collapse = torch.stack(collapse_terms).mean()
+        valid_count = mask.sum().clamp_min(1).float()
+        latent_std = latent[mask].std(dim=0, unbiased=False).mean() if mask.any() else latent.new_tensor(0.0)
+        mode_separation = torch.stack(separation_terms, dim=1).sum() / valid_count
+        information_floor = torch.relu(latent.new_tensor(0.5) - latent_std).square()
+        mode_collapse = torch.exp(-mode_separation)
         residual_energy = delta.square().sum() / x.square().sum().clamp_min(self.config.epsilon)
-        residual_ratio = delta.norm() / x.norm().clamp_min(self.config.epsilon)
-        shadow_entropy = torch.stack(entropy_terms, dim=1).sum() / valid_count
+        entropy = torch.stack(entropy_terms, dim=1).sum() / valid_count
 
-        next_state = HeraclitusState(mean, variance, shadow_log_weights, steps)
         if detach_state:
-            next_state = next_state.detach()
-
+            runtime = runtime.detach()
         regularization = {
-            "predictive_nll": predictive_nll,
-            "shadow_collapse": shadow_collapse,
+            "predictive_nll": torch.stack(nlls, dim=1).sum() / valid_count,
+            "mode_collapse": mode_collapse,
             "orthogonality": orthogonality_error(self.projection.float(), self.config.epsilon),
             "residual_energy": residual_energy,
+            "information_floor": information_floor,
+            "calibration": torch.stack(calibration_terms, dim=1).sum() / valid_count,
         }
         diagnostics = HeraclitusDiagnostics(
             innovation_rms=torch.stack(innovation_terms, dim=1).sum() / valid_count,
             surprise_mean=torch.stack(surprise_terms, dim=1).sum() / valid_count,
-            residual_ratio=residual_ratio,
-            posterior_variance=variance.mean(),
-            shadow_entropy=shadow_entropy,
-            effective_shadows=shadow_entropy.exp(),
-            best_shadow_probability=torch.stack(best_terms, dim=1).sum() / valid_count,
-            next_best_shadow_probability=torch.stack(second_terms, dim=1).sum() / valid_count,
+            residual_ratio=delta.norm() / x.norm().clamp_min(self.config.epsilon),
+            posterior_variance=runtime.variance.mean(),
+            mode_entropy=entropy,
+            effective_modes=entropy.exp(),
+            best_mode_probability=torch.stack(best_terms, dim=1).sum() / valid_count,
+            next_best_mode_probability=torch.stack(second_terms, dim=1).sum() / valid_count,
+            mode_separation=mode_separation,
+            latent_standard_deviation=latent_std,
         )
-        return HeraclitusOutput(output, next_state, regularization, diagnostics)
+        return HeraclitusOutput(output, runtime, regularization, diagnostics)
 
-    def _shadow_means(self, prior_mean: Tensor, prior_variance: Tensor) -> Tensor:
-        b, r = prior_mean.shape
-        k = self.config.num_shadows
-        base = self.shadow_offsets.float().unsqueeze(0).expand(b, -1, -1)
-        contextual = torch.tanh(prior_mean @ self.shadow_context.float()).view(b, k, r)
-        offsets = base + self.config.shadow_context_scale * contextual
-        offsets = offsets - offsets.mean(dim=1, keepdim=True)
-        offsets = offsets / offsets.square().mean(dim=-1, keepdim=True).sqrt().clamp_min(
+    def _low_rank_gaussian(
+        self, error: Tensor, prior: HeraclitusState, observation_noise: Tensor
+    ) -> Tuple[Tensor, Tensor]:
+        diagonal = (prior.mode_variances + observation_noise[:, None, :]).clamp_min(
             self.config.epsilon
         )
-        return prior_mean.unsqueeze(1) + (
-            self.config.shadow_scale * prior_variance.sqrt().unsqueeze(1) * offsets
-        )
-
-    def _prior_log_weights(self, previous_log_weights: Tensor) -> Tensor:
-        learned_prior = torch.log_softmax(self.shadow_prior_logits.float(), dim=0).unsqueeze(0)
-        memory = self.config.shadow_weight_memory
-        blended = memory * previous_log_weights + (1.0 - memory) * learned_prior
-        return torch.log_softmax(blended, dim=-1)
+        inverse_diagonal = diagonal.reciprocal()
+        base_solution = inverse_diagonal * error
+        logdet = diagonal.log().sum(dim=-1)
+        quadratic = (error * base_solution).sum(dim=-1)
+        factors = prior.covariance_factors
+        if self.config.covariance_rank:
+            weighted_factors = inverse_diagonal.unsqueeze(-1) * factors
+            middle = torch.einsum("bkrc,bkrd->bkcd", factors, weighted_factors)
+            identity = torch.eye(self.config.covariance_rank, device=error.device, dtype=error.dtype)
+            middle = middle + identity.view(1, 1, self.config.covariance_rank, self.config.covariance_rank)
+            rhs = torch.einsum("bkrc,bkr->bkc", factors, base_solution)
+            solved_middle = torch.linalg.solve(middle, rhs.unsqueeze(-1)).squeeze(-1)
+            correction = torch.einsum("bkrc,bkc->bkr", weighted_factors, solved_middle)
+            solved = base_solution - correction
+            quadratic = (error * solved).sum(dim=-1)
+            logdet = logdet + torch.linalg.slogdet(middle).logabsdet
+        else:
+            solved = base_solution
+        constant = self.config.state_size * 1.8378770664093453
+        return -0.5 * (quadratic + logdet + constant), solved
 
     @staticmethod
-    def parameter_count(hidden_size: int, state_size: int, num_shadows: int = 4) -> int:
-        if hidden_size < 1 or state_size < 2 or num_shadows < 2:
+    def _masked_state(old: HeraclitusState, new: HeraclitusState, valid: Tensor) -> HeraclitusState:
+        mode_mask = valid.unsqueeze(-1)
+        factor_mask = mode_mask.unsqueeze(-1)
+        return HeraclitusState(
+            torch.where(mode_mask, new.mode_means, old.mode_means),
+            torch.where(mode_mask, new.mode_variances, old.mode_variances),
+            torch.where(factor_mask, new.covariance_factors, old.covariance_factors),
+            torch.where(valid, new.mode_log_weights, old.mode_log_weights),
+            torch.where(valid.squeeze(-1), new.steps, old.steps),
+        )
+
+    @staticmethod
+    def parameter_count(
+        hidden_size: int,
+        state_size: int,
+        num_modes: int = 4,
+        covariance_rank: int = 4,
+        transition_reflections: int = 4,
+    ) -> int:
+        if min(hidden_size, state_size, num_modes, transition_reflections) < 1:
             raise ValueError("invalid dimensions")
         return (
             2 * hidden_size * state_size
-            + num_shadows * state_size * state_size
-            + num_shadows * state_size
-            + 4 * state_size
-            + num_shadows
+            + num_modes * state_size
+            + transition_reflections * state_size
+            + num_modes * state_size
+            + state_size * num_modes * state_size
+            + num_modes * state_size
+            + state_size
+            + state_size * 2 * state_size
+            + num_modes * state_size * covariance_rank
+            + num_modes
             + 3
         )
 
