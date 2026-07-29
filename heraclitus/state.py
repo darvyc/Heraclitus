@@ -1,4 +1,4 @@
-"""Explicit runtime state for the Heraclitus LLM parameter."""
+"""Explicit runtime state for Heraclitus 1.0."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -10,43 +10,50 @@ from torch import Tensor
 
 @dataclass(frozen=True)
 class HeraclitusState:
-    """Per-sequence live flow, counter-flow, and valid-token count."""
+    """Per-sequence posterior mean, variance, shadow weights, and token count."""
 
-    live: Tensor
-    counter: Tensor
+    mean: Tensor
+    variance: Tensor
+    shadow_log_weights: Tensor
     steps: Tensor
 
-    def validate(self, batch_size: int, state_size: int) -> None:
-        if self.live.shape != (batch_size, state_size):
+    def validate(self, batch_size: int, state_size: int, num_shadows: int) -> None:
+        if self.mean.shape != (batch_size, state_size):
+            raise ValueError(f"mean must have shape ({batch_size}, {state_size})")
+        if self.variance.shape != (batch_size, state_size):
+            raise ValueError(f"variance must have shape ({batch_size}, {state_size})")
+        if self.shadow_log_weights.shape != (batch_size, num_shadows):
             raise ValueError(
-                f"live must have shape ({batch_size}, {state_size}), "
-                f"got {tuple(self.live.shape)}"
-            )
-        if self.counter.shape != (batch_size, state_size):
-            raise ValueError(
-                f"counter must have shape ({batch_size}, {state_size}), "
-                f"got {tuple(self.counter.shape)}"
+                f"shadow_log_weights must have shape ({batch_size}, {num_shadows})"
             )
         if self.steps.shape != (batch_size,):
-            raise ValueError(
-                f"steps must have shape ({batch_size},), got {tuple(self.steps.shape)}"
-            )
+            raise ValueError(f"steps must have shape ({batch_size},)")
         if self.steps.dtype != torch.long:
             raise ValueError("steps must use torch.long")
-        if self.live.device != self.counter.device or self.live.device != self.steps.device:
+        devices = {
+            self.mean.device,
+            self.variance.device,
+            self.shadow_log_weights.device,
+            self.steps.device,
+        }
+        if len(devices) != 1:
             raise ValueError("all state tensors must be on the same device")
+        if torch.any(self.variance <= 0):
+            raise ValueError("variance must be strictly positive")
 
     def detach(self) -> "HeraclitusState":
         return HeraclitusState(
-            live=self.live.detach(),
-            counter=self.counter.detach(),
+            mean=self.mean.detach(),
+            variance=self.variance.detach(),
+            shadow_log_weights=self.shadow_log_weights.detach(),
             steps=self.steps.detach(),
         )
 
     def clone(self) -> "HeraclitusState":
         return HeraclitusState(
-            live=self.live.clone(),
-            counter=self.counter.clone(),
+            mean=self.mean.clone(),
+            variance=self.variance.clone(),
+            shadow_log_weights=self.shadow_log_weights.clone(),
             steps=self.steps.clone(),
         )
 
@@ -55,39 +62,45 @@ class HeraclitusState:
         device: Optional[Union[str, torch.device]] = None,
         dtype: Optional[torch.dtype] = None,
     ) -> "HeraclitusState":
-        target_dtype = dtype if dtype is not None else self.live.dtype
-        live = self.live.to(device=device, dtype=target_dtype)
-        counter = self.counter.to(device=device, dtype=target_dtype)
-        steps = self.steps.to(device=live.device)
-        return HeraclitusState(live=live, counter=counter, steps=steps)
+        target_dtype = dtype if dtype is not None else self.mean.dtype
+        mean = self.mean.to(device=device, dtype=target_dtype)
+        return HeraclitusState(
+            mean=mean,
+            variance=self.variance.to(device=mean.device, dtype=target_dtype),
+            shadow_log_weights=self.shadow_log_weights.to(
+                device=mean.device, dtype=target_dtype
+            ),
+            steps=self.steps.to(device=mean.device),
+        )
 
     def index_select(self, indices: Tensor) -> "HeraclitusState":
-        """Reorder or select batch rows for beam search and dynamic batching."""
+        """Reorder or duplicate rows for beam search and dynamic batching."""
         if indices.ndim != 1 or indices.dtype != torch.long:
             raise ValueError("indices must be a rank-1 torch.long tensor")
-        indices = indices.to(device=self.live.device)
+        indices = indices.to(device=self.mean.device)
         return HeraclitusState(
-            live=self.live.index_select(0, indices),
-            counter=self.counter.index_select(0, indices),
+            mean=self.mean.index_select(0, indices),
+            variance=self.variance.index_select(0, indices),
+            shadow_log_weights=self.shadow_log_weights.index_select(0, indices),
             steps=self.steps.index_select(0, indices),
         )
 
     def as_dict(self) -> Dict[str, Tensor]:
-        """Return a tensor-only representation suitable for checkpointing."""
         return {
-            "live": self.live,
-            "counter": self.counter,
+            "mean": self.mean,
+            "variance": self.variance,
+            "shadow_log_weights": self.shadow_log_weights,
             "steps": self.steps,
         }
 
     @classmethod
     def from_dict(cls, values: Dict[str, Tensor]) -> "HeraclitusState":
-        """Restore state from ``as_dict`` output."""
-        required = {"live", "counter", "steps"}
+        required = {"mean", "variance", "shadow_log_weights", "steps"}
         if set(values) != required:
             raise ValueError(f"state dictionary keys must be {sorted(required)}")
         return cls(
-            live=values["live"],
-            counter=values["counter"],
+            mean=values["mean"],
+            variance=values["variance"],
+            shadow_log_weights=values["shadow_log_weights"],
             steps=values["steps"],
         )
