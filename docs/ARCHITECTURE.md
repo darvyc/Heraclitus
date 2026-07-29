@@ -1,131 +1,119 @@
-# Heraclitus Architecture
+# Heraclitus architecture
 
-This document describes the mechanisms implemented by the current research prototype. It does not claim that those mechanisms improve task performance. See `MATHEMATICAL_AUDIT.md` for the critical assessment, formal assumptions, unresolved problems, and minimum experimental standard.
+Heraclitus is an LLM parameter subsystem. It receives a transformer hidden stream, applies a causal state-conditioned low-rank residual, and returns a hidden stream of the same shape together with explicit continuation state and training diagnostics.
 
-## 1. Direction-conditioned attention
+## Components
 
-Each block begins with ordinary scaled dot-product attention. For batch b, head h, query token i, and key token j:
+### HeraclitusConfig
 
-    base_score[b,h,i,j] = q[b,h,i] dot k[b,h,j] / sqrt(d_head)
+`HeraclitusConfig` fixes hidden width, state width, state time constants, norm bounds, residual gain, gate temperature, opposition strength, dropout, and numerical epsilon. Construction validates every domain constraint.
 
-Each key token is also mapped to a learned unit 3-vector `a[b,h,j]`. Given the model's live unit direction `d`, the final score is:
+### HeraclitusParameter
 
-    score[b,h,i,j] = base_score[b,h,i,j]
-                       + direction_scale[h] * a[b,h,j] dot d
+`HeraclitusParameter` owns all trainable tensors:
 
-The directional term varies over key index j, which is the softmax normalisation axis. This is essential. Adding one constant to an entire attention row would have no effect because softmax is translation-invariant.
+```text
+projection:           D x R
+reconstruction:       R x D
+state_seed:           R
+gate_bias:            1
+residual_scale_logit: 1
+opposition_logit:     1
+```
 
-The merged attention context is returned internally so the local update for the output projection uses the tensor that actually enters that projection.
+The module transforms `(B, T, D)` to `(B, T, D)`. It can be inserted at any residual boundary in a transformer block.
 
-## 2. Local forward adaptation
+### HeraclitusState
 
-When `forward(..., learn=True)` is called, each block applies two updates under `torch.no_grad()`.
+`HeraclitusState` contains:
 
-### Attention output projection
+```text
+live:    B x R
+counter: B x R
+steps:   B
+```
 
-For the output projection `y = W x`, the code uses a bounded multi-output Oja rule:
+State is external to the module. It can be detached, cloned, moved, selected, reordered, checkpointed, and restored. This keeps sequence history isolated from trainable model parameters and gives host inference engines direct control over batching and beam order.
 
-    Delta W = E[y x^T] - diag(E[y^2]) W
+### HeraclitusOutput
 
-The Oja term opposes unconstrained Hebbian norm growth. The resulting parameter displacement is clipped to a configured fraction of the current weight norm.
+`HeraclitusOutput` returns:
 
-### MLP output bias
+- transformed hidden states
+- continuation state
+- regularisation terms
+- diagnostics
 
-Let `y_bar` be the current mean output and `m` its exponential moving target. The local additive-bias update is:
+Its `regularization_loss` method combines the auxiliary terms with explicit weights.
 
-    b_next = b - eta * (y_bar - m)
-    m_next = rho * m + (1 - rho) * y_bar
+## Data path
 
-The subtraction sign follows gradient descent on local squared prediction error.
+For each token:
 
-These are local adaptation rules. They are not a substitute for a task-level objective, and the repository does not presently contain a convergence theorem for the coupled dynamics.
+1. RMS-normalise the hidden vector in float32.
+2. Project it into the state space through a norm-bounded matrix.
+3. Convert the projected vector to a unit observation.
+4. Form a dual-flow direction from live and counter states.
+5. Compute a bounded scalar gate from observation alignment.
+6. Separate and amplify the latent component aligned with the dual flow.
+7. Reconstruct a low-rank residual through a second norm-bounded matrix.
+8. Add the residual to the original hidden vector.
+9. Update counter state from the prior live state.
+10. Update live state from the current observation.
 
-## 3. Sphere-valued state
+Output computation precedes the state update. The token therefore cannot use information from any future token.
 
-Each transformer stores a unit direction `d` on `S^2`.
+## Training semantics
 
-A projection frame `P` with shape `(d_model, 3)` maps pooled hidden features to a target direction:
+Trainable tensors are changed only by the host optimiser. Forward execution performs no in-place parameter update. The live and counter states are tensors in the autograd graph during the current call; returned state is detached by default to bound graph lifetime across generation chunks.
 
-    target = normalise(mean(features) P)
+The module supplies four auxiliary losses:
 
-The state update is:
+- projection-frame orthogonality
+- live/counter consistency
+- state drift
+- residual energy
 
-    d_next = normalise(momentum * d + (1 - momentum) * target)
+These combine with the host language-model objective through `regularization_loss`.
 
-Transformers in the same `FlowRegistry` and with the same hidden width receive the same orthonormal projection frame. This removes the obvious error of comparing coordinates produced by independently rotated 3D frames.
+## Inference semantics
 
-A shared projection frame does not guarantee semantic comparability when hidden feature spaces themselves are unaligned. The `orthogonal_procrustes` utility can fit a proper 3D rotation from shared anchor observations, but users must still supply and validate those anchors.
+Each active sequence owns one state row. Chunked decoding passes returned state into the next call. Dynamic batching and beam search reorder state through `HeraclitusState.index_select` using the same indices applied to the host model cache.
 
-## 4. Peer discovery and null calibration
+Masked tokens are exact identity operations for Heraclitus and do not advance state.
 
-`FlowRegistry.query_aligned` returns peers satisfying:
+## Numerical semantics
 
-    d_source dot d_target >= threshold
+Geometry and low-rank products execute in float32. The residual is cast back to the hidden-stream dtype before addition. Effective matrices are differentiably projected into configured norm balls on every call. Live state, counter state, and observations use deterministic zero-vector fallbacks.
 
-For independent uniform directions on `S^2`:
-
-    P(random match) = (1 - threshold) / 2
-
-With N registry members, the expected random out-degree is:
-
-    (N - 1) * (1 - threshold) / 2
-
-The registry exposes both this null expectation and its inverse threshold calculation. A reported threshold is scientifically incomplete unless registry size and the implied random degree are also reported.
-
-Connections are currently records only. They do not transmit activations, aggregate messages, or alter predictions.
-
-## 5. Counter-Flow snapshots
-
-Before a local update, the model stores:
-
-- step number
-- previous direction
-- cloned state dictionary
-- connection identifiers
-- metadata
-- a clean frozen architecture clone for distillation queries
-
-The frozen clone is created without a registry and without historical Counter-Flows. This prevents recursive copying of the swarm and its snapshot history.
-
-Retaining K full snapshots of a P-parameter model still costs O(KP) storage. Delta checkpoints or low-rank parameter differences are required for scale.
-
-Counter-Flows are not yet included in an explicit regularisation term. At present they provide auditability and a callable frozen target, not a complete dual-flow optimisation law.
-
-## 6. Module map
+## Package map
 
 ```text
 heraclitus/
-├── core.py              DualFlowTransformer and update lifecycle
-├── attention.py         key-dependent direction-conditioned attention
-├── forward_learner.py   bounded Oja and local prediction-error updates
-├── direction.py         stable S^2 geometry
-├── mathematics.py       null model and Procrustes frame alignment
-├── counter_flow.py      frozen snapshots
-├── network.py           registry, shared frame, calibrated search
-├── connections.py       directed edge records
-└── utils.py             identifiers
+├── __init__.py       public API and version
+├── config.py         validated immutable configuration
+├── mathematics.py    bounded linear algebra and spherical geometry
+├── parameter.py      LLM parameter, output, and diagnostics
+├── state.py          explicit continuation state
+└── py.typed           typing marker
 ```
 
-## 7. Update lifecycle
+## Release contract
 
-1. `net(x, learn=True)` is called.
-2. A clean frozen Counter-Flow snapshot is created from the pre-update state.
-3. Each transformer block computes attention and MLP outputs.
-4. The attention output projection receives the bounded Oja update using its true input and output activities.
-5. The MLP output bias descends its local prediction error.
-6. The final hidden features update the unit direction through the shared frame.
-7. The step counter increments.
-8. A caller may scan the registry and create similarity-edge records using a calibrated threshold.
+The release contract is enforced by tests for:
 
-## 8. Non-claims
-
-The current code does not establish that:
-
-- three dimensions preserve useful model-state information
-- direction cosine measures hypothesis similarity
-- local updates improve any task
-- Counter-Flows prevent forgetting
-- graph connections enable cooperation
-- the coupled dynamics converge
-
-Those questions require the experiments and baselines specified in `MATHEMATICAL_AUDIT.md`.
+- output shape and dtype
+- parameter-count exactness
+- parameter immutability during forward execution
+- gradient flow
+- strict causality
+- full-sequence and chunk equivalence
+- batch isolation
+- mask semantics
+- state reordering and checkpointing
+- state-dictionary round trips
+- float16 execution
+- finite nonnegative auxiliary losses
+- unit-sphere state transitions
+- effective matrix bounds
+- per-token residual bounds
