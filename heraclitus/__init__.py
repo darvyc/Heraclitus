@@ -8,11 +8,7 @@ from .mathematics import (
     safe_unit,
     spherical_ema,
 )
-from .parameter import (
-    HeraclitusDiagnostics,
-    HeraclitusOutput,
-    HeraclitusParameter,
-)
+from .parameter import HeraclitusDiagnostics, HeraclitusOutput, HeraclitusParameter
 from .state import HeraclitusState
 
 __all__ = [
@@ -29,4 +25,4 @@ __all__ = [
     "spherical_ema",
 ]
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
