@@ -1,6 +1,22 @@
-# Heraclitus
+# Heraclitus 1.0
 
-Heraclitus is a causal, state-conditioned, low-rank parameter for transformer language models. It adds a bounded adaptive residual to an existing hidden stream while preserving standard gradient training, explicit sequence state, chunked generation, masking, mixed precision, and model serialisation.
+Heraclitus is an experimental causal, predictive, low-rank state adapter for transformer language models. It estimates a compact latent sequence state, preserves several probabilistic alternatives to its next prediction, and writes only prediction error back into the residual stream.
+
+It is a research hypothesis, not a demonstrated replacement for attention, a long-context guarantee, or a production-proven improvement. Its value must be established by compute-matched experiments.
+
+## Core idea
+
+For each hidden token, Heraclitus:
+
+1. projects the RMS-normalised hidden vector into a low-dimensional latent observation;
+2. predicts the next latent state with a stable diagonal transition;
+3. constructs K Gaussian predictive shadows around that forecast;
+4. scores each shadow by the observation likelihood;
+5. retains the full posterior distribution, including the best and next-best latent alternatives;
+6. performs a diagonal Kalman-style correction;
+7. reconstructs a bounded, surprise-gated innovation into the transformer stream.
+
+The shadows do not claim to store literal alternative text answers. They store alternative latent predictions that can be trained and scored against subsequent hidden observations.
 
 ## Install
 
@@ -8,36 +24,31 @@ Heraclitus is a causal, state-conditioned, low-rank parameter for transformer la
 pip install -e .
 ```
 
-Heraclitus requires Python 3.9 or later and PyTorch 2.0 or later.
+Requires Python 3.9 or later and PyTorch 2.0 or later.
 
-## LLM integration
+## Usage
 
 ```python
 import torch
 from heraclitus import HeraclitusConfig, HeraclitusParameter
 
-hidden_size = 4096
-heraclitus = HeraclitusParameter(
+module = HeraclitusParameter(
     HeraclitusConfig(
-        hidden_size=hidden_size,
+        hidden_size=4096,
         state_size=64,
+        num_shadows=4,
         max_residual_scale=0.10,
     )
 )
 
-hidden_states = torch.randn(2, 128, hidden_size)
-attention_mask = torch.ones(2, 128, dtype=torch.bool)
+hidden = torch.randn(2, 128, 4096)
+mask = torch.ones(2, 128, dtype=torch.bool)
+result = module.forward_with_state(hidden, attention_mask=mask)
 
-result = heraclitus.forward_with_state(
-    hidden_states,
-    attention_mask=attention_mask,
-)
-
-hidden_states = result.hidden_states
-auxiliary_loss = result.regularization_loss()
+hidden = result.hidden_states
+state = result.state
+loss = language_model_loss + result.regularization_loss()
 ```
-
-Place one `HeraclitusParameter` after the attention residual, after the MLP residual, or once at the end of each transformer block. Its input and output both have shape `(batch, sequence, hidden_size)`.
 
 ## Stateful generation
 
@@ -46,34 +57,88 @@ state = None
 outputs = []
 
 for hidden_chunk in hidden_chunks:
-    result = heraclitus.forward_with_state(hidden_chunk, state=state)
+    result = module.forward_with_state(hidden_chunk, state=state)
     outputs.append(result.hidden_states)
     state = result.state
 ```
 
-The continuation state contains one live flow, one counter-flow, and one valid-token counter per sequence. It can be detached, cloned, moved between devices, converted to a tensor dictionary, saved, and restored for continued generation.
+The continuation state contains:
+
+- posterior latent mean;
+- diagonal posterior variance;
+- posterior log-probabilities for all Gaussian shadows;
+- valid-token count.
+
+It can be detached, cloned, checkpointed, moved across devices, and reordered for beam search or dynamic batching.
 
 ## Mathematical contract
 
-For hidden width `D` and state width `R`, Heraclitus uses exactly:
+For observation z_t and previous posterior state (m_(t-1), v_(t-1)):
 
 ```text
-2 * D * R + R + 3
+a = bounded learned retention in (0, 1)
+m_prior = a * m_previous
+v_prior = a^2 * v_previous + q
+
+shadow_k = m_prior + shadow_scale * sqrt(v_prior) * offset_k
+log_weight_k = previous_log_weight_k + log N(z_t | shadow_k, v_prior + r)
+weights = softmax(log_weight)
+
+m_mix = sum_k weights_k * shadow_k
+innovation = z_t - m_mix
+gain = v_prior / (v_prior + r)
+
+m_t = m_mix + gain * innovation
+v_t = (1 - gain) * v_prior + weighted_shadow_spread
+
+delta_t = bounded_scale * surprise_gate * innovation * reconstruction
+y_t = x_t + delta_t
 ```
 
-trainable scalar parameters. Runtime state uses `2 * B * R + B` scalars for batch size `B`.
+The output at token t depends only on the current token, the state accumulated before it, and learned parameters. Masked tokens are unchanged and do not advance state.
 
-The parameter satisfies these invariants:
+## Why Gaussian shadows
 
-- Strict causality: output token `t` depends only on tokens `0` through `t` and state accumulated before `t`.
-- Batch isolation: one sequence cannot alter another sequence's state.
-- Unit state: live flow and counter-flow remain on the unit sphere.
-- Bounded adaptation: effective projection and reconstruction matrices are constrained to norm balls and residual gain is bounded.
-- Autograd safety: forward execution never mutates trainable parameters.
-- Chunk equivalence: processing a sequence in chunks with the returned state matches processing it in one call when dropout is disabled.
-- Mask correctness: masked tokens are unchanged and do not advance state.
+A single mean collapses uncertainty into one guess. Gaussian shadows retain multiple locally plausible latent futures. Their likelihoods are updated by evidence, so the system can preserve a runner-up hypothesis rather than irreversibly discarding it.
 
-The full equations, bounds, and proof sketches are in `docs/MATHEMATICS.md`. Integration patterns are in `docs/INTEGRATION.md`.
+This only earns the phrase next-best prediction when three conditions hold:
+
+- shadows are diverse rather than collapsed;
+- likelihoods are calibrated;
+- future-token predictive loss demonstrates that the runner-up mode contains useful information.
+
+## Training objective
+
+The auxiliary objective combines:
+
+- predictive Gaussian-mixture negative log likelihood;
+- shadow anti-collapse penalty;
+- projection orthogonality penalty;
+- residual-energy budget.
+
+The task loss remains primary.
+
+## Required empirical validation
+
+A credible evaluation must compare against:
+
+- a parameter-matched MLP adapter;
+- an ordinary low-rank adapter;
+- a single-state innovation filter;
+- a GRU-style adapter;
+- a small state-space layer;
+- Heraclitus without shadows, uncertainty, surprise gating, or predictive loss.
+
+Report perplexity, downstream quality, long-context performance, training throughput, generation latency, memory, calibration, shadow utilisation, and statistical uncertainty.
+
+## Limitations
+
+- The current recurrence is sequential over tokens.
+- Diagonal covariance cannot represent correlated latent uncertainty.
+- Gaussian shadows are local latent hypotheses, not discrete semantic plans.
+- More shadows increase cost linearly.
+- Stable mathematics does not establish useful language modelling.
+- Speculative decoding requires state rollback for rejected tokens.
 
 ## Testing
 
@@ -81,7 +146,7 @@ The full equations, bounds, and proof sketches are in `docs/MATHEMATICS.md`. Int
 pytest -q
 ```
 
-The test suite verifies causality, chunk equivalence, batch isolation, gradients, masking, mixed precision, serialisation, state geometry, bounded matrices, and mathematical utilities.
+The tests cover shape and dtype preservation, causality, chunk equivalence, batch isolation, masking, gradients, serialisation, state reordering, probabilistic diagnostics, and bounded effective matrices.
 
 ## License
 
