@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "heraclitus"
 version = "1.0.0"
-description = "A causal, state-conditioned, low-rank parameter for transformer language models."
+description = "An experimental innovation-filtered low-rank state adapter with Gaussian predictive shadows."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.9"
@@ -17,10 +17,12 @@ keywords = [
     "adapter",
     "low-rank",
     "state-space",
+    "kalman-filter",
+    "gaussian-mixture",
     "pytorch",
 ]
 classifiers = [
-    "Development Status :: 5 - Production/Stable",
+    "Development Status :: 3 - Alpha",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
