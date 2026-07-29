@@ -33,7 +33,7 @@ Connections currently record graph edges but do not exchange activations or mess
 pip install -e .
 ```
 
-The current source uses Python 3.10 type syntax and PyTorch 2.0 or later.
+Requires Python 3.9 or later and PyTorch 2.0 or later.
 
 ## Quickstart
 
