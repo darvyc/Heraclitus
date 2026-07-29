@@ -1,13 +1,14 @@
-"""Direction-modulated multi-head self-attention.
+"""Direction-conditioned multi-head self-attention.
 
-A standard scaled-dot-product attention block, except that the per-head logits
-are biased by a 3D-direction-derived term. This lets the transformer's current
-S^2 orientation continuously shape what it attends to, without having to
-re-allocate any structural capacity.
+The directional term must vary along the key-token axis. A scalar added to an
+entire attention row is annihilated by softmax translation invariance and has
+no effect on the output.
 """
 from __future__ import annotations
 
 import math
+from typing import Tuple, Union
+
 import torch
 from torch import Tensor, nn
 
@@ -25,28 +26,42 @@ class DirectionModulatedAttention(nn.Module):
         self.out = nn.Linear(d_model, d_model, bias=False)
         self.dropout = nn.Dropout(dropout)
 
-        # Per-head 3-vector that gets dotted with the module's live direction.
-        # The resulting scalar bias gently warps each head's logits.
-        self.head_axes = nn.Parameter(torch.randn(n_heads, 3) * 0.1)
+        # Each key token receives a learned 3D axis per head. Dotting these axes
+        # with the live direction creates a key-dependent logit bias, which does
+        # survive softmax because it varies across the normalisation dimension.
+        self.direction_keys = nn.Linear(d_model, n_heads * 3, bias=False)
+        self.direction_scale = nn.Parameter(torch.full((n_heads,), 0.1))
 
-    def forward(self, x: Tensor, direction: Tensor) -> Tensor:
-        # x: (B, T, d_model)  direction: (3,)
+    def forward(
+        self,
+        x: Tensor,
+        direction: Tensor,
+        return_context: bool = False,
+    ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
+        # x: (B, T, d_model), direction: (3,)
         b, t, _ = x.shape
         qkv = self.qkv(x).reshape(b, t, 3, self.n_heads, self.d_head)
-        q, k, v = qkv.unbind(dim=2)                   # (B, T, H, Dh) each
-        q = q.transpose(1, 2)                         # (B, H, T, Dh)
+        q, k, v = qkv.unbind(dim=2)
+        q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
         scale = 1.0 / math.sqrt(self.d_head)
-        logits = (q @ k.transpose(-2, -1)) * scale    # (B, H, T, T)
+        logits = (q @ k.transpose(-2, -1)) * scale
 
-        # Direction bias: one scalar per head, broadcast over the logit grid.
-        head_bias = (self.head_axes @ direction)      # (H,)
-        logits = logits + head_bias.view(1, self.n_heads, 1, 1)
+        unit_direction = direction / direction.norm().clamp(min=1e-8)
+        token_axes = self.direction_keys(x).reshape(b, t, self.n_heads, 3)
+        token_axes = token_axes.transpose(1, 2)
+        token_axes = token_axes / token_axes.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        key_bias = torch.einsum("bhtc,c->bht", token_axes, unit_direction)
+        key_bias = key_bias * self.direction_scale.view(1, self.n_heads, 1)
+        logits = logits + key_bias.unsqueeze(-2)
 
         attn = torch.softmax(logits, dim=-1)
         attn = self.dropout(attn)
-        out = attn @ v                                # (B, H, T, Dh)
-        out = out.transpose(1, 2).reshape(b, t, self.d_model)
-        return self.out(out)
+        context = attn @ v
+        merged_context = context.transpose(1, 2).reshape(b, t, self.d_model)
+        output = self.out(merged_context)
+        if return_context:
+            return output, merged_context
+        return output
