@@ -1,4 +1,4 @@
-"""Configuration for the Heraclitus LLM parameter."""
+"""Configuration for Heraclitus 1.0."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -6,15 +6,18 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class HeraclitusConfig:
-    """Validated configuration for a state-conditioned low-rank LLM parameter."""
+    """Validated configuration for the predictive low-rank state adapter."""
 
     hidden_size: int
-    state_size: int = 16
-    state_decay: float = 0.95
-    counter_decay: float = 0.995
+    state_size: int = 64
+    num_shadows: int = 4
+    min_retention: float = 0.50
+    max_retention: float = 0.999
+    process_noise_floor: float = 1e-4
+    observation_noise_floor: float = 1e-3
+    initial_variance: float = 1.0
+    shadow_scale: float = 0.25
     max_residual_scale: float = 0.10
-    temperature: float = 0.25
-    opposition_strength: float = 0.50
     projection_norm_bound: float = 1.0
     reconstruction_norm_bound: float = 1.0
     dropout: float = 0.0
@@ -27,23 +30,21 @@ class HeraclitusConfig:
             raise ValueError("state_size must be at least 2")
         if self.state_size > self.hidden_size:
             raise ValueError("state_size must not exceed hidden_size")
+        if self.num_shadows < 2:
+            raise ValueError("num_shadows must be at least 2")
+        if not 0.0 <= self.min_retention < self.max_retention < 1.0:
+            raise ValueError("retention bounds must satisfy 0 <= min < max < 1")
         for name, value in (
-            ("state_decay", self.state_decay),
-            ("counter_decay", self.counter_decay),
+            ("process_noise_floor", self.process_noise_floor),
+            ("observation_noise_floor", self.observation_noise_floor),
+            ("initial_variance", self.initial_variance),
+            ("shadow_scale", self.shadow_scale),
+            ("max_residual_scale", self.max_residual_scale),
+            ("projection_norm_bound", self.projection_norm_bound),
+            ("reconstruction_norm_bound", self.reconstruction_norm_bound),
+            ("epsilon", self.epsilon),
         ):
-            if not 0.0 <= value < 1.0:
-                raise ValueError(f"{name} must lie in [0, 1)")
-        if self.max_residual_scale <= 0.0:
-            raise ValueError("max_residual_scale must be positive")
-        if self.temperature <= 0.0:
-            raise ValueError("temperature must be positive")
-        if not 0.0 <= self.opposition_strength <= 1.0:
-            raise ValueError("opposition_strength must lie in [0, 1]")
-        if self.projection_norm_bound <= 0.0:
-            raise ValueError("projection_norm_bound must be positive")
-        if self.reconstruction_norm_bound <= 0.0:
-            raise ValueError("reconstruction_norm_bound must be positive")
+            if value <= 0.0:
+                raise ValueError(f"{name} must be positive")
         if not 0.0 <= self.dropout < 1.0:
             raise ValueError("dropout must lie in [0, 1)")
-        if self.epsilon <= 0.0:
-            raise ValueError("epsilon must be positive")
