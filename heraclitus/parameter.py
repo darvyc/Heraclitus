@@ -1,8 +1,8 @@
-"""Heraclitus 1.0: a causal innovation-filtered low-rank transformer adapter."""
+"""Heraclitus 1.0: a causal predictive low-rank transformer parameter."""
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import torch
 from torch import Tensor, nn
@@ -18,6 +18,8 @@ class HeraclitusDiagnostics:
     surprise_mean: Tensor
     residual_ratio: Tensor
     posterior_variance: Tensor
+    shadow_entropy: Tensor
+    effective_shadows: Tensor
     best_shadow_probability: Tensor
     next_best_shadow_probability: Tensor
 
@@ -46,14 +48,13 @@ class HeraclitusOutput:
 
 
 class HeraclitusParameter(nn.Module):
-    """Predict latent state, retain alternatives, and write back only innovation.
+    """Maintain predictive latent state and write bounded innovation to an LLM.
 
-    Each token is projected into a low-dimensional observation. A stable diagonal
-    transition predicts the next latent state. Multiple Gaussian shadows encode
-    plausible alternatives around that prediction. Their probabilities are
-    updated from the current observation, and a diagonal Kalman-style correction
-    forms the posterior state. The transformer receives a bounded reconstruction
-    of the innovation rather than a redundant copy of the observation.
+    The module is causal and batch-isolated. A contractive diagonal transition
+    predicts a latent observation. Context-conditioned Gaussian shadows retain
+    several plausible local futures. Evidence updates their probabilities, a
+    diagonal uncertainty filter corrects the state, and only normalised
+    prediction error is reconstructed into the transformer residual stream.
     """
 
     def __init__(self, config: HeraclitusConfig):
@@ -80,6 +81,7 @@ class HeraclitusParameter(nn.Module):
             config.epsilon
         )
         self.shadow_offsets = nn.Parameter(offsets)
+        self.shadow_context = nn.Parameter(torch.zeros(r, k * r))
         self.shadow_prior_logits = nn.Parameter(torch.zeros(k))
 
         self.residual_scale_logit = nn.Parameter(torch.tensor(-2.0))
@@ -132,6 +134,21 @@ class HeraclitusParameter(nn.Module):
         steps = torch.zeros(batch_size, dtype=torch.long, device=target)
         return HeraclitusState(mean, variance, log_weights, steps)
 
+    def predictive_distribution(self, state: HeraclitusState) -> Tuple[Tensor, Tensor, Tensor]:
+        """Return one-step shadow means, diagonal variance, and prior probabilities."""
+        batch_size = state.mean.shape[0]
+        state.validate(batch_size, self.config.state_size, self.config.num_shadows)
+        mean = state.mean.float()
+        variance = state.variance.float().clamp_min(self.config.epsilon)
+        a = self.retention().unsqueeze(0)
+        prior_mean = a * mean
+        prior_variance = (a.square() * variance + self.process_noise().unsqueeze(0)).clamp_min(
+            self.config.epsilon
+        )
+        shadow_means = self._shadow_means(prior_mean, prior_variance)
+        prior_log_weights = self._prior_log_weights(state.shadow_log_weights.float())
+        return shadow_means, prior_variance, prior_log_weights.exp()
+
     def forward(
         self,
         hidden_states: Tensor,
@@ -173,12 +190,6 @@ class HeraclitusParameter(nn.Module):
         a = self.retention().unsqueeze(0)
         q = self.process_noise().unsqueeze(0)
         obs_noise = self.observation_noise().unsqueeze(0)
-        offsets = self.shadow_offsets.float()
-        offsets = offsets - offsets.mean(dim=0, keepdim=True)
-        offsets = offsets / offsets.square().mean(dim=-1, keepdim=True).sqrt().clamp_min(
-            self.config.epsilon
-        )
-        scale = self.config.shadow_scale
         residual_scale = self.config.max_residual_scale * torch.sigmoid(
             self.residual_scale_logit.float()
         )
@@ -188,9 +199,9 @@ class HeraclitusParameter(nn.Module):
         collapse_terms = []
         innovation_terms = []
         surprise_terms = []
+        entropy_terms = []
         best_terms = []
         second_terms = []
-
         log_two_pi = latent.new_tensor(1.8378770664093453)
 
         for token_index in range(t):
@@ -199,10 +210,9 @@ class HeraclitusParameter(nn.Module):
 
             prior_mean = a * mean
             prior_variance = (a.square() * variance + q).clamp_min(self.config.epsilon)
-            shadow_means = prior_mean.unsqueeze(1) + (
-                scale * prior_variance.sqrt().unsqueeze(1) * offsets.unsqueeze(0)
-            )
+            shadow_means = self._shadow_means(prior_mean, prior_variance)
             predictive_variance = (prior_variance + obs_noise).unsqueeze(1)
+            prior_log_weights = self._prior_log_weights(shadow_log_weights)
 
             error_by_shadow = z.unsqueeze(1) - shadow_means
             component_nll = 0.5 * (
@@ -210,10 +220,12 @@ class HeraclitusParameter(nn.Module):
                 + predictive_variance.log()
                 + log_two_pi
             ).sum(dim=-1)
-            component_log_prob = shadow_log_weights - component_nll
+            component_log_prob = prior_log_weights - component_nll
             mixture_log_prob = torch.logsumexp(component_log_prob, dim=-1)
-            posterior_log_weights = component_log_prob - mixture_log_prob.unsqueeze(-1)
-            posterior_weights = posterior_log_weights.exp()
+            raw_posterior = torch.softmax(component_log_prob, dim=-1)
+            floor = self.config.min_shadow_probability
+            posterior_weights = raw_posterior * (1.0 - floor * self.config.num_shadows) + floor
+            posterior_log_weights = posterior_weights.log()
 
             predicted_mean = (posterior_weights.unsqueeze(-1) * shadow_means).sum(dim=1)
             innovation = z - predicted_mean
@@ -236,21 +248,30 @@ class HeraclitusParameter(nn.Module):
                 + torch.nn.functional.softplus(self.surprise_gate_scale.float())
                 * surprise.sqrt()
             )
-            token_delta = residual_scale * gate * (innovation @ reconstruction)
+            whitened_innovation = innovation / (prior_variance + obs_noise).sqrt()
+            token_delta = residual_scale * gate * (whitened_innovation @ reconstruction)
             token_delta = self.dropout(token_delta)
             token_delta = torch.where(valid, token_delta, torch.zeros_like(token_delta))
             deltas.append(token_delta)
 
+            entropy = -(posterior_weights * posterior_log_weights).sum(dim=-1, keepdim=True)
             sorted_weights = posterior_weights.sort(dim=-1, descending=True).values
             best_terms.append(torch.where(valid, sorted_weights[:, :1], torch.zeros_like(valid)))
-            second_terms.append(
-                torch.where(valid, sorted_weights[:, 1:2], torch.zeros_like(valid))
+            second_terms.append(torch.where(valid, sorted_weights[:, 1:2], torch.zeros_like(valid)))
+            entropy_terms.append(torch.where(valid, entropy, torch.zeros_like(entropy)))
+            nlls.append(
+                torch.where(valid.squeeze(-1), -mixture_log_prob, torch.zeros_like(mixture_log_prob))
             )
-            nlls.append(torch.where(valid.squeeze(-1), -mixture_log_prob, torch.zeros_like(mixture_log_prob)))
-            pairwise = torch.pdist(offsets, p=2).square().mean()
-            collapse_terms.append(torch.exp(-pairwise))
+            pairwise = torch.cdist(shadow_means, shadow_means, p=2)
+            eye = torch.eye(self.config.num_shadows, device=pairwise.device, dtype=torch.bool)
+            off_diagonal = pairwise.masked_select(~eye.unsqueeze(0)).view(b, -1)
+            collapse_terms.append(torch.exp(-off_diagonal.square().mean(dim=-1)).mean())
             innovation_terms.append(
-                torch.where(valid, innovation.square().mean(dim=-1, keepdim=True).sqrt(), torch.zeros_like(valid, dtype=x.dtype))
+                torch.where(
+                    valid,
+                    innovation.square().mean(dim=-1, keepdim=True).sqrt(),
+                    torch.zeros_like(valid, dtype=x.dtype),
+                )
             )
             surprise_terms.append(torch.where(valid, surprise, torch.zeros_like(surprise)))
 
@@ -266,6 +287,7 @@ class HeraclitusParameter(nn.Module):
         shadow_collapse = torch.stack(collapse_terms).mean()
         residual_energy = delta.square().sum() / x.square().sum().clamp_min(self.config.epsilon)
         residual_ratio = delta.norm() / x.norm().clamp_min(self.config.epsilon)
+        shadow_entropy = torch.stack(entropy_terms, dim=1).sum() / valid_count
 
         next_state = HeraclitusState(mean, variance, shadow_log_weights, steps)
         if detach_state:
@@ -282,10 +304,32 @@ class HeraclitusParameter(nn.Module):
             surprise_mean=torch.stack(surprise_terms, dim=1).sum() / valid_count,
             residual_ratio=residual_ratio,
             posterior_variance=variance.mean(),
+            shadow_entropy=shadow_entropy,
+            effective_shadows=shadow_entropy.exp(),
             best_shadow_probability=torch.stack(best_terms, dim=1).sum() / valid_count,
             next_best_shadow_probability=torch.stack(second_terms, dim=1).sum() / valid_count,
         )
         return HeraclitusOutput(output, next_state, regularization, diagnostics)
+
+    def _shadow_means(self, prior_mean: Tensor, prior_variance: Tensor) -> Tensor:
+        b, r = prior_mean.shape
+        k = self.config.num_shadows
+        base = self.shadow_offsets.float().unsqueeze(0).expand(b, -1, -1)
+        contextual = torch.tanh(prior_mean @ self.shadow_context.float()).view(b, k, r)
+        offsets = base + self.config.shadow_context_scale * contextual
+        offsets = offsets - offsets.mean(dim=1, keepdim=True)
+        offsets = offsets / offsets.square().mean(dim=-1, keepdim=True).sqrt().clamp_min(
+            self.config.epsilon
+        )
+        return prior_mean.unsqueeze(1) + (
+            self.config.shadow_scale * prior_variance.sqrt().unsqueeze(1) * offsets
+        )
+
+    def _prior_log_weights(self, previous_log_weights: Tensor) -> Tensor:
+        learned_prior = torch.log_softmax(self.shadow_prior_logits.float(), dim=0).unsqueeze(0)
+        memory = self.config.shadow_weight_memory
+        blended = memory * previous_log_weights + (1.0 - memory) * learned_prior
+        return torch.log_softmax(blended, dim=-1)
 
     @staticmethod
     def parameter_count(hidden_size: int, state_size: int, num_shadows: int = 4) -> int:
@@ -293,6 +337,7 @@ class HeraclitusParameter(nn.Module):
             raise ValueError("invalid dimensions")
         return (
             2 * hidden_size * state_size
+            + num_shadows * state_size * state_size
             + num_shadows * state_size
             + 4 * state_size
             + num_shadows
