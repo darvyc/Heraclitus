@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+title: Heraclitus
+message: Cite this software using the metadata in this file.
+type: software
+authors:
+  - name: The Heraclitus Authors
+version: 1.0.0
+date-released: 2026-07-29
+repository-code: https://github.com/darvyc/Heraclitus
+license: MIT
