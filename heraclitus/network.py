@@ -1,34 +1,32 @@
-"""Global registry of live DualFlowTransformers.
-
-The registry is the substrate the network 'scans' to find aligned peers. It is
-intentionally simple — a dict keyed by stable id, plus a brute-force cosine
-search. For large swarms a kd-tree or HNSW index could be substituted; the
-public API would not change.
-"""
+"""Registry and shared geometric frame for live DualFlowTransformers."""
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Dict, Iterator, List, Tuple
+from typing import TYPE_CHECKING, Dict, Iterator, List, Optional, Tuple
 
 import torch
 
 from .direction import Direction
+from .mathematics import expected_random_degree, threshold_for_expected_random_degree
 
-if TYPE_CHECKING:  # pragma: no cover
+if TYPE_CHECKING:
     from .core import DualFlowTransformer
 
 
 class FlowRegistry:
-    """A thread-unsafe in-process registry of live transformers.
-
-    Multiple transformers sharing one registry can discover each other via
-    `query_aligned`. A transformer never appears as a candidate match for
-    itself.
-    """
-
-    def __init__(self) -> None:
+    def __init__(self, frame_seed: Optional[int] = None) -> None:
         self._members: Dict[str, "DualFlowTransformer"] = {}
+        self._direction_frames: Dict[int, torch.Tensor] = {}
+        self._frame_generator: Optional[torch.Generator] = None
+        if frame_seed is not None:
+            self._frame_generator = torch.Generator().manual_seed(frame_seed)
 
-    # ------------------------------------------------------------------ membership
+    def direction_frame(self, d_model: int) -> torch.Tensor:
+        """Return the shared projection frame for a given hidden width."""
+        if d_model not in self._direction_frames:
+            self._direction_frames[d_model] = Direction.random_projection(
+                d_model, generator=self._frame_generator
+            )
+        return self._direction_frames[d_model].clone()
 
     def register(self, transformer: "DualFlowTransformer") -> None:
         if transformer.flow_id in self._members:
@@ -38,7 +36,7 @@ class FlowRegistry:
     def deregister(self, flow_id: str) -> None:
         self._members.pop(flow_id, None)
 
-    def get(self, flow_id: str) -> "DualFlowTransformer | None":
+    def get(self, flow_id: str) -> Optional["DualFlowTransformer"]:
         return self._members.get(flow_id)
 
     def __len__(self) -> int:
@@ -50,40 +48,29 @@ class FlowRegistry:
     def ids(self) -> List[str]:
         return list(self._members.keys())
 
-    # ------------------------------------------------------------------ search
+    def null_expected_degree(self, threshold: float) -> float:
+        return expected_random_degree(len(self), threshold)
+
+    def threshold_for_null_degree(self, expected_degree: float) -> float:
+        return threshold_for_expected_random_degree(len(self), expected_degree)
 
     def query_aligned(
         self,
         direction: torch.Tensor,
         threshold: float = 0.7,
-        exclude: str | None = None,
-        top_k: int | None = None,
+        exclude: Optional[str] = None,
+        top_k: Optional[int] = None,
     ) -> List[Tuple["DualFlowTransformer", float]]:
-        """Return live transformers whose direction has cosine ≥ threshold.
-
-        Parameters
-        ----------
-        direction : (3,) tensor
-            The query direction (assumed unit-norm).
-        threshold : float
-            Cosine cutoff for the alignment cone (1.0 = identical, 0.0 = orthogonal).
-        exclude : str | None
-            Optional flow_id to skip (typically the querying transformer's own id).
-        top_k : int | None
-            If given, return only the k most aligned matches.
-
-        Returns
-        -------
-        List of (transformer, cosine) pairs, sorted by descending cosine.
-        """
+        if not -1.0 <= threshold <= 1.0:
+            raise ValueError("threshold must lie in [-1, 1]")
+        if top_k is not None and top_k < 0:
+            raise ValueError("top_k must be non-negative")
         matches: List[Tuple["DualFlowTransformer", float]] = []
-        for fid, t in self._members.items():
-            if fid == exclude:
+        for flow_id, transformer in self._members.items():
+            if flow_id == exclude:
                 continue
-            cos = float(Direction.cosine(direction, t.direction))
-            if cos >= threshold:
-                matches.append((t, cos))
+            cosine = float(Direction.cosine(direction, transformer.direction))
+            if cosine >= threshold:
+                matches.append((transformer, cosine))
         matches.sort(key=lambda pair: pair[1], reverse=True)
-        if top_k is not None:
-            matches = matches[:top_k]
-        return matches
+        return matches if top_k is None else matches[:top_k]
