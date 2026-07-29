@@ -1,18 +1,4 @@
-"""Forward-pass learning rules.
-
-Two complementary, gradient-free updates are applied during `forward()`:
-
-1. **Hebbian pre/post correlation** on the value-projection of each attention
-   block. This nudges the projection toward its empirical input/output
-   covariance, scaled by a small learning rate.
-
-2. **Predictive-coding residual** that compares the block's output with a
-   short EMA of past outputs. The discrepancy (the 'surprise') is used to
-   adjust an additive bias on the output projection, so high-surprise tokens
-   exert more pull than low-surprise ones.
-
-Both rules use only locally available statistics — no global loss, no .backward().
-"""
+"""Local, gradient-free adaptation rules with explicit stability controls."""
 from __future__ import annotations
 
 import torch
@@ -20,25 +6,48 @@ from torch import Tensor, nn
 
 
 class ForwardLearner:
-    """Stateless container of forward-pass update rules."""
-
-    def __init__(self, lr: float = 1e-3, ema_decay: float = 0.95):
+    def __init__(
+        self,
+        lr: float = 1e-3,
+        ema_decay: float = 0.95,
+        max_relative_update: float = 1e-3,
+    ):
+        if lr <= 0:
+            raise ValueError("lr must be positive")
+        if not 0.0 <= ema_decay < 1.0:
+            raise ValueError("ema_decay must lie in [0, 1)")
+        if max_relative_update <= 0:
+            raise ValueError("max_relative_update must be positive")
         self.lr = lr
         self.ema_decay = ema_decay
+        self.max_relative_update = max_relative_update
 
     @torch.no_grad()
     def hebbian_update(self, linear: nn.Linear, pre: Tensor, post: Tensor) -> None:
-        """Δ W ∝ <post · preᵀ> — vanilla Hebb with a unit-norm decay."""
-        # pre:  (..., in_features)
-        # post: (..., out_features)
-        pre_flat = pre.reshape(-1, pre.shape[-1])          # (N, in)
-        post_flat = post.reshape(-1, post.shape[-1])       # (N, out)
-        n = max(pre_flat.shape[0], 1)
-        # outer product mean: (out, in)
-        delta = (post_flat.t() @ pre_flat) / n
-        # normalise so a single update can't blow up the weight scale.
-        delta = delta / (delta.norm() + 1e-8)
-        linear.weight.add_(self.lr * delta)
+        """Apply a multi-output Oja update to the actual synaptic activities.
+
+        delta = E[post pre^T] - diag(E[post^2]) W.
+        The second term prevents unconstrained Hebbian norm growth. The final
+        parameter displacement is clipped relative to the current weight norm.
+        """
+        pre_flat = pre.reshape(-1, pre.shape[-1])
+        post_flat = post.reshape(-1, post.shape[-1])
+        if pre_flat.shape[0] != post_flat.shape[0]:
+            raise ValueError("pre and post must have the same sample count")
+        if pre_flat.shape[1] != linear.in_features:
+            raise ValueError("pre does not match linear.in_features")
+        if post_flat.shape[1] != linear.out_features:
+            raise ValueError("post does not match linear.out_features")
+
+        covariance = post_flat.transpose(0, 1) @ pre_flat / max(pre_flat.shape[0], 1)
+        post_power = post_flat.square().mean(dim=0, keepdim=True).transpose(0, 1)
+        delta = covariance - post_power * linear.weight
+        proposed = self.lr * delta
+
+        weight_norm = linear.weight.norm().clamp(min=1e-8)
+        max_update_norm = self.max_relative_update * weight_norm
+        scale = torch.clamp(max_update_norm / proposed.norm().clamp(min=1e-8), max=1.0)
+        linear.weight.add_(proposed * scale)
 
     @torch.no_grad()
     def predictive_update(
@@ -47,12 +56,10 @@ class ForwardLearner:
         output: Tensor,
         ema_buffer: Tensor,
     ) -> Tensor:
-        """Update an additive bias toward reducing recent prediction error.
-
-        Returns the updated EMA buffer so the caller can persist it.
-        """
-        flat = output.reshape(-1, output.shape[-1]).mean(dim=0)   # (out,)
-        surprise = flat - ema_buffer                              # (out,)
-        bias.add_(self.lr * surprise)
-        new_ema = self.ema_decay * ema_buffer + (1 - self.ema_decay) * flat
-        return new_ema
+        """Descend the local squared prediction error of an additive bias."""
+        mean_output = output.reshape(-1, output.shape[-1]).mean(dim=0)
+        surprise = mean_output - ema_buffer
+        # For L = 0.5 ||output - ema||^2 and d(output)/d(bias) = I,
+        # gradient descent requires subtraction. Addition amplifies surprise.
+        bias.sub_(self.lr * surprise)
+        return self.ema_decay * ema_buffer + (1.0 - self.ema_decay) * mean_output

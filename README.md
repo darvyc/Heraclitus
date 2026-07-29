@@ -1,21 +1,31 @@
 # Heraclitus
 
-> *"πάντα ῥεῖ" — everything flows.*
+> *"πάντα ῥεῖ" - everything flows.*
 >
-> *"The road up and the road down are one and the same."* — Heraclitus, Fragment 60
+> *"The road up and the road down are one and the same."* - Heraclitus, Fragment 60
 
-**Heraclitus** is a reference implementation of a **3D Dual-Flow Transformer**: a transformer that (1) learns during its forward pass, (2) carries a 3D directional vector that represents the orientation of its current hypothesis in a shared latent space, (3) discovers and forms connections with peer transformers whose directions align with its newly trained orientation, and (4) preserves its prior parametric self as a *Counter-Flow* — a frozen, time-shifted derivative that flows against the live network.
+Heraclitus is an experimental 3D Dual-Flow Transformer research prototype. It combines inline local adaptation, a sphere-valued state vector, direction-conditioned attention, similarity-based peer discovery, and frozen prior-state snapshots called Counter-Flows.
 
-The name is taken from Heraclitus of Ephesus, whose doctrine of *unity of opposites* and ever-flowing river (`πάντα ῥεῖ`) is the conceptual ancestor of every dual-flow / opposing-current architecture in the literature. The forward flow is the river; the Counter-Flow is the same river an instant ago.
+## Research status
 
-## Core ideas
+This repository is not a validated learning method. It currently provides mechanisms and mathematical diagnostics that must still be tested against task-level objectives, strong baselines, repeated seeds, uncertainty estimates, and ablations.
 
-| Concept | Implementation |
+Read `docs/MATHEMATICAL_AUDIT.md` before treating any architectural claim as established. That document states what the model now implements, what was mathematically defective in the initial version, and what remains absent.
+
+## Core mechanisms
+
+| Mechanism | Current implementation |
 |---|---|
-| **Forward-pass learning** | A local, gradient-free Hebbian + predictive-coding update applied inline during `forward()`. No backward pass is required for adaptation. |
-| **3D direction vector** | Each `DualFlowTransformer` carries a learned unit vector `d ∈ S²` summarising its current representational orientation. |
-| **Network-wide scanning** | A lightweight `FlowRegistry` indexes every live transformer by its `d`. After each update, the transformer queries the registry for peers whose directions fall inside an alignment cone and forms weighted `FlowConnection`s. |
-| **Counter-Flow** | Before any update, the prior weights, direction, and connection map are snapshot-frozen as a `CounterFlow` derivative. Counter-Flows form a backwards-pointing shadow network that can be queried, distilled from, or used as a regulariser. |
+| Forward adaptation | A bounded multi-output Oja update on the attention output projection and a local squared-error descent step on the MLP output bias. |
+| 3D state | Each transformer carries a unit vector `d` on `S^2`, updated from pooled hidden features through a registry-shared projection frame. |
+| Direction-conditioned attention | Each key token receives a direction-dependent logit bias that varies along the softmax axis. |
+| Peer discovery | A `FlowRegistry` finds peers above a cosine threshold and exposes an exact random-alignment null model for threshold calibration. |
+| Counter-Flow | Each update stores a clean, frozen prior model clone without recursively copying the registry or earlier snapshots. |
+| Frame alignment | An orthogonal Procrustes utility aligns 3D frames from shared anchor observations. |
+
+## Important limitations
+
+Connections currently record graph edges but do not exchange activations or messages. Counter-Flows provide frozen targets but are not yet included in an explicit regularisation objective. A shared projection frame does not by itself guarantee that independently trained hidden spaces have the same semantic basis. Three dimensions may be too severe a bottleneck.
 
 ## Install
 
@@ -23,7 +33,7 @@ The name is taken from Heraclitus of Ephesus, whose doctrine of *unity of opposi
 pip install -e .
 ```
 
-Requires Python ≥ 3.9 and PyTorch ≥ 2.0.
+Requires Python 3.9 or later and PyTorch 2.0 or later.
 
 ## Quickstart
 
@@ -31,9 +41,7 @@ Requires Python ≥ 3.9 and PyTorch ≥ 2.0.
 import torch
 from heraclitus import DualFlowTransformer, FlowRegistry
 
-registry = FlowRegistry()
-
-# Build three transformers and register them in a shared flow network.
+registry = FlowRegistry(frame_seed=7)
 nets = [
     DualFlowTransformer(d_model=64, n_heads=4, n_layers=2, registry=registry)
     for _ in range(3)
@@ -41,29 +49,35 @@ nets = [
 
 x = torch.randn(2, 16, 64)
 for net in nets:
-    y = net(x, learn=True)            # forward-pass learning + direction update
-    net.scan_and_connect(threshold=0.7)  # forge connections to aligned peers
+    y = net(x, learn=True)
 
-# The previous incarnation of net[0] is preserved as a Counter-Flow:
+# Calibrate a threshold to one expected random match in this registry.
+threshold = registry.threshold_for_null_degree(expected_degree=1.0)
+for net in nets:
+    net.scan_and_connect(threshold=threshold)
+
 print(nets[0].counter_flow.summary())
 ```
 
-See `examples/` for a runnable swarm demo.
-
 ## Repository layout
 
-```
+```text
 heraclitus/
-├── heraclitus/        # library source
-├── examples/          # runnable demos
-├── tests/             # pytest suite
-└── docs/ARCHITECTURE.md
+├── heraclitus/
+├── examples/
+├── tests/
+└── docs/
+    ├── ARCHITECTURE.md
+    └── MATHEMATICAL_AUDIT.md
 ```
 
-## Citation
+## Testing
 
-If you use Heraclitus in academic work, please cite the architecture document
-in `docs/ARCHITECTURE.md`.
+```bash
+pytest -q
+```
+
+The mathematical regression tests verify that direction changes attention, the shared frame is actually shared, the predictive update descends its declared local error, antipodal sphere interpolation is finite, Procrustes alignment recovers a known rotation, and Counter-Flow snapshots do not recursively copy registry history.
 
 ## License
 
