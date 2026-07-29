@@ -1,209 +1,448 @@
-# Mathematical specification
+# Heraclitus Release Edition — Mathematical Specification
 
-## 1. Objects
+## 1. State space
 
-Let:
+Let the transformer hidden width be `d`, latent dimension `r`, number of persistent modes `K`, and covariance rank `c`. For token `t` and mode `k`,
 
-```text
-X in R^(B x T x D)
-P in R^(D x R)
-U in R^(R x D)
-live_t in S^(R-1)
-counter_t in S^(R-1)
-```
+\[
+\mathcal S_{t,k}=(\mu_{t,k},D_{t,k},U_{t,k},\pi_{t,k}),
+\]
 
-`B` is batch size, `T` is sequence length, `D` is LLM hidden width, and `R` is Heraclitus state width.
+where
 
-The trainable parameter set is:
+\[
+\mu_{t,k}\in\mathbb R^r,
+\quad D_{t,k}=\operatorname{diag}(d_{t,k})\succ0,
+\quad U_{t,k}\in\mathbb R^{r\times c},
+\quad \pi_{t,k}\ge0,
+\quad \sum_k\pi_{t,k}=1.
+\]
 
-```text
-Theta = {P, U, seed, gate_bias, scale_logit, opposition_logit}
-```
+The mode covariance is
 
-Its exact size is:
+\[
+P_{t,k}=D_{t,k}+U_{t,k}U_{t,k}^{\top}\succ0.
+\]
 
-```text
-|Theta| = 2 D R + R + 3
-```
+The latent posterior is the Gaussian mixture
 
-## 2. Effective bounded matrices
+\[
+p(s_t\mid z_{1:t})=\sum_{k=1}^{K}\pi_{t,k}\mathcal N(s_t;\mu_{t,k},P_{t,k}).
+\]
 
-Raw trainable matrices are projected differentiably into Frobenius norm balls:
+The projected observation is
 
-```text
-P_hat = P * min(1, C_P / max(||P||_F, epsilon))
-U_hat = U * min(1, C_U / max(||U||_F, epsilon))
-```
+\[
+z_t=W_p^{\top}\operatorname{RMSNorm}(x_t).
+\]
 
-Therefore:
+## 2. Mixture moments
 
-```text
-||P_hat||_2 <= ||P_hat||_F <= C_P
-||U_hat||_2 <= ||U_hat||_F <= C_U
-```
+The aggregate mean is
 
-## 3. Token normalisation and observation
+\[
+\bar\mu_t=\sum_k\pi_{t,k}\mu_{t,k}.
+\]
 
-For token vector `x_t`:
+By the law of total covariance,
 
-```text
-rms(x_t) = sqrt(mean_j x_t[j]^2 + epsilon)
-x_bar_t = x_t / rms(x_t)
-z_t = x_bar_t P_hat
-obs_t = unit(z_t)
-```
+\[
+\bar P_t=\sum_k\pi_{t,k}\left[P_{t,k}+(\mu_{t,k}-\bar\mu_t)(\mu_{t,k}-\bar\mu_t)^{\top}\right].
+\]
 
-`unit(v)` returns `v / ||v||` for nonzero `v` and a deterministic unit pole for a zero vector.
+This decomposes uncertainty into within-mode covariance and between-mode disagreement.
 
-Because RMS normalisation gives `||x_bar_t||_2 <= sqrt(D)`:
+## 3. Stable higher-dimensional dynamics
 
-```text
-||z_t||_2 <= C_P sqrt(D)
-```
+For learned vectors `v_j`, define Householder reflections
 
-## 4. Dual-flow state
+\[
+H_j=I-2\frac{v_jv_j^{\top}}{v_j^{\top}v_j},
+\qquad H_j^{\top}H_j=I.
+\]
 
-The live flow tracks the current sequence direction. The counter-flow is a slower trace of prior live states.
+The orthogonal transport is
 
-For valid token `t`:
+\[
+Q=H_mH_{m-1}\cdots H_1,
+\qquad Q^{\top}Q=I.
+\]
 
-```text
-counter_(t+1) = unit(kappa counter_t + (1 - kappa) live_t)
-live_(t+1) = unit(beta live_t + (1 - beta) obs_t)
-```
+For each mode,
 
-where:
+\[
+a_{t,k}=a_{\min}+(a_{\max}-a_{\min})\sigma(\alpha_k+C\bar\mu_{t-1}),
+\]
 
-```text
-0 <= beta < 1
-0 <= kappa < 1
-```
+with
 
-The direction used to modulate token `t` is computed before observing token `t`:
+\[
+0\le a_{\min}<a_{\max}<1.
+\]
 
-```text
-lambda = sigmoid(opposition_logit)
-dual_t = unit((1 + lambda) live_t - lambda counter_t)
-```
+The transition operator is
 
-This ordering gives a causal recurrence. Masked tokens leave both states unchanged.
+\[
+A_{t,k}=\operatorname{diag}(a_{t,k})Q.
+\]
 
-## 5. State-conditioned residual
+Since `Q` is orthogonal,
 
-Token alignment and gate are:
+\[
+\|A_{t,k}\|_2\le a_{\max}<1,
+\]
 
-```text
-score_t = dot(obs_t, dual_t)
-gate_t = sigmoid(score_t / temperature + gate_bias)
-```
+so
 
-The aligned latent component is:
+\[
+\|A_{t,k}u-A_{t,k}v\|_2\le a_{\max}\|u-v\|_2.
+\]
 
-```text
-aligned_t = dot(z_t, dual_t) dual_t
-adapted_t = z_t + lambda aligned_t
-```
+The prior mean is
 
-The bounded residual gain is:
+\[
+\mu^-_{t,k}=A_{t,k}\mu_{t-1,k}.
+\]
 
-```text
-alpha = alpha_max sigmoid(scale_logit)
-```
+## 4. Covariance propagation
 
-The residual is:
+The exact linear prediction is
 
-```text
-delta_t = alpha gate_t adapted_t U_hat
-y_t = x_t + delta_t
-```
+\[
+P^-_{t,k}=A_{t,k}P_{t-1,k}A_{t,k}^{\top}+Q_{t,k}.
+\]
 
-Dropout, when configured, is applied to `delta_t` during training.
+The structured representation is propagated as
 
-## 6. Residual bound
+\[
+D^-_{t,k}=\operatorname{diag}(a_{t,k}^{\odot2}\odot d_{t-1,k}+q_{t,k}),
+\]
 
-Since `dual_t` is unit length:
+\[
+U^-_{t,k}=\operatorname{diag}(a_{t,k})QU_{t-1,k}+B_k,
+\]
 
-```text
-||aligned_t||_2 <= ||z_t||_2
-||adapted_t||_2 <= (1 + lambda) ||z_t||_2
-```
+with positive context-dependent process noise
 
-Because `0 <= gate_t <= 1`, `0 <= lambda <= 1`, and `0 <= alpha <= alpha_max`:
+\[
+q_{t,k}=q_{\min}+\operatorname{softplus}(\beta_k+G_q\bar\mu^-_t).
+\]
 
-```text
-||delta_t||_2
-<= alpha_max C_U (1 + lambda) C_P sqrt(D)
-<= 2 alpha_max C_U C_P sqrt(D)
-```
+Thus
 
-With dropout probability `p`, the training-time bound is multiplied by `1 / (1 - p)` for retained coordinates. Evaluation uses the bound above directly.
+\[
+P^-_{t,k}=D^-_{t,k}+U^-_{t,k}(U^-_{t,k})^{\top}.
+\]
 
-## 7. Causality proof
+## 5. Observation model
 
-Base case: token `0` uses only `x_0` and the learned initial state.
+The latent observation model is
 
-Inductive step: assume `live_t` and `counter_t` depend only on tokens before `t`. Output `y_t` uses `x_t`, `live_t`, and `counter_t`, so it depends only on tokens through `t`. The update to state `t+1` uses only state `t` and observation `t`. Therefore future tokens cannot affect past outputs.
+\[
+z_t=s_t+\varepsilon_t,
+\qquad \varepsilon_t\sim\mathcal N(0,R_t),
+\]
 
-## 8. Chunk equivalence
+where
 
-The recurrence is Markovian in:
+\[
+R_t=\operatorname{diag}(r_t),
+\qquad
+r_t=r_{\min}+\operatorname{softplus}(\gamma+G_r\bar\mu^-_t).
+\]
 
-```text
-state_t = {live_t, counter_t, steps_t}
-```
+The predictive observation covariance is
 
-Passing the final state from one chunk as the initial state of the next chunk reproduces the same recurrence as a single call. With deterministic evaluation settings, concatenated chunk outputs equal full-sequence outputs.
+\[
+S_{t,k}=P^-_{t,k}+R_t
+=\Delta_{t,k}+U^-_{t,k}(U^-_{t,k})^{\top},
+\]
 
-## 9. Batch isolation
+with
 
-Every state tensor has shape `(B, R)` and every transition is row-wise. No reduction is performed across the batch dimension. Therefore sequence `b` cannot influence sequence `b'` for `b != b'`.
+\[
+\Delta_{t,k}=D^-_{t,k}+R_t.
+\]
 
-## 10. Auxiliary objective
+## 6. Woodbury inverse and determinant lemma
 
-Training uses the task objective plus weighted regularisers:
+Define
 
-```text
-L_total = L_task
-        + w_orth L_orth
-        + w_counter L_counter
-        + w_drift L_drift
-        + w_residual L_residual
-```
+\[
+M_{t,k}=I_c+(U^-_{t,k})^{\top}\Delta_{t,k}^{-1}U^-_{t,k}.
+\]
 
-The terms are:
+Then
 
-```text
-L_orth = mean((column_normalise(P)^T column_normalise(P) - I)^2)
-L_counter = mean((1 - dot(live_t, counter_t)) / 2)
-L_drift = mean((1 - dot(live_t, live_(t+1))) / 2)
-L_residual = sum(delta^2) / max(sum(X^2), epsilon)
-```
+\[
+S_{t,k}^{-1}=\Delta_{t,k}^{-1}-\Delta_{t,k}^{-1}U^-_{t,k}M_{t,k}^{-1}(U^-_{t,k})^{\top}\Delta_{t,k}^{-1}.
+\]
 
-All four terms are finite and nonnegative.
+The determinant lemma gives
 
-## 11. Complexity
+\[
+\log\det S_{t,k}=\log\det\Delta_{t,k}+\log\det M_{t,k}.
+\]
 
-For each token, the dominant operations are the two low-rank matrix products:
+For innovation
 
-```text
-x_bar_t P_hat
-adapted_t U_hat
-```
+\[
+e_{t,k}=z_t-\mu^-_{t,k},
+\]
 
-Time complexity:
+the Gaussian log likelihood is
 
-```text
-O(B T D R)
-```
+\[
+\ell_{t,k}=-\frac12\left[e_{t,k}^{\top}S_{t,k}^{-1}e_{t,k}+\log\det S_{t,k}+r\log(2\pi)\right].
+\]
 
-Trainable parameter memory:
+Only a `c x c` matrix is inverted.
 
-```text
-O(D R)
-```
+## 7. Markov mode dynamics
 
-Runtime continuation-state memory:
+Let `T_t` be row-stochastic:
 
-```text
-O(B R)
-```
+\[
+T_t=\operatorname{softmax}_{\mathrm{row}}(\Theta+\mathcal C(\bar\mu_{t-1})).
+\]
+
+The prior mode probability is
+
+\[
+\pi^-_{t,k}=\sum_j\pi_{t-1,j}T_{t,jk}.
+\]
+
+Bayesian evidence gives
+
+\[
+\pi_{t,k}=\frac{\pi^-_{t,k}\exp(\ell_{t,k})}{\sum_j\pi^-_{t,j}\exp(\ell_{t,j})}.
+\]
+
+A probability floor is applied before renormalisation to prevent numerical extinction.
+
+## 8. Posterior correction
+
+The gain is
+
+\[
+K_{t,k}=P^-_{t,k}S_{t,k}^{-1}.
+\]
+
+The posterior mean is
+
+\[
+\mu_{t,k}=\mu^-_{t,k}+K_{t,k}e_{t,k}.
+\]
+
+The Joseph covariance form is
+
+\[
+P_{t,k}=(I-K_{t,k})P^-_{t,k}(I-K_{t,k})^{\top}+K_{t,k}R_tK_{t,k}^{\top}.
+\]
+
+This preserves positive semidefiniteness under finite precision. The resulting covariance is projected back onto
+
+\[
+\mathcal M_c=\{D+UU^{\top}:D\succ0,\ U\in\mathbb R^{r\times c}\}.
+\]
+
+If
+
+\[
+P_{t,k}=V\Lambda V^{\top},
+\]
+
+retain the leading `c` eigenpairs:
+
+\[
+U_{t,k}=V_{1:c}\Lambda_{1:c}^{1/2},
+\]
+
+and assign the remaining marginal energy to
+
+\[
+d_{t,k}=\operatorname{diag}(P_{t,k}-U_{t,k}U_{t,k}^{\top})+\epsilon.
+\]
+
+This is an assumed-density projection, not an exact dense-covariance filter.
+
+## 9. Information geometry
+
+The Fisher metric for the Gaussian mean is
+
+\[
+\mathcal I_{\mu}=S_{t,k}^{-1}.
+\]
+
+The whitened innovation
+
+\[
+w_{t,k}=S_{t,k}^{-1/2}e_{t,k}
+\]
+
+has squared norm
+
+\[
+\|w_{t,k}\|_2^2=e_{t,k}^{\top}S_{t,k}^{-1}e_{t,k},
+\]
+
+which is Mahalanobis surprise and is invariant under invertible linear reparameterisations. The update
+
+\[
+P^-_{t,k}S_{t,k}^{-1}e_{t,k}
+\]
+
+is a covariance-preconditioned natural-gradient step in latent space.
+
+## 10. Reliability-gated residual write
+
+The mixture innovation is
+
+\[
+\bar e_t=z_t-\bar\mu^-_t.
+\]
+
+Let the predictive mixture covariance be
+
+\[
+\bar S_t=\sum_k\pi^-_{t,k}\left[S_{t,k}+(\mu^-_{t,k}-\bar\mu^-_t)(\mu^-_{t,k}-\bar\mu^-_t)^{\top}\right].
+\]
+
+The normalised innovation is
+
+\[
+\hat e_t=\bar S_t^{-1/2}\bar e_t.
+\]
+
+Novelty and reliability are
+
+\[
+g_{\mathrm{nov},t}=\sigma(a_n\|\hat e_t\|_2^2+b_n),
+\]
+
+\[
+g_{\mathrm{rel},t}=\exp\left(-a_r\frac{\operatorname{tr}(\bar S_t)}{r}\right).
+\]
+
+The residual correction is
+
+\[
+\delta_t=\rho_{\max}\sigma(\rho)g_{\mathrm{nov},t}g_{\mathrm{rel},t}W_r^{\top}\hat e_t,
+\qquad y_t=x_t+\delta_t.
+\]
+
+This separates novelty from trustworthiness and bounds the intervention.
+
+## 11. Information-preservation objectives
+
+Let `C_z` be the batch covariance of projected observations. A variance floor is
+
+\[
+\mathcal L_{\mathrm{var}}=\frac1r\sum_i\max(0,\tau-\sqrt{(C_z)_{ii}+\epsilon})^2.
+\]
+
+Projection redundancy is penalised by
+
+\[
+\mathcal L_{\mathrm{decor}}=\frac1{r(r-1)}\sum_{i\ne j}(C_z)_{ij}^2.
+\]
+
+Mode distinctness uses symmetric KL separation:
+
+\[
+\mathcal L_{\mathrm{mode}}=\frac{2}{K(K-1)}\sum_{i<j}\max\left(0,\tau_{\mathrm{KL}}-\frac12[D_{\mathrm{KL}}(i\|j)+D_{\mathrm{KL}}(j\|i)]\right).
+\]
+
+Its strength is weighted by posterior ambiguity
+
+\[
+w_t=\frac{H(\pi_t)}{\log K},
+\]
+
+so separation pressure is strongest only when several modes remain plausible.
+
+## 12. Calibration
+
+Define the posterior-weighted squared Mahalanobis statistic
+
+\[
+q_t=\sum_k\pi^-_{t,k}e_{t,k}^{\top}S_{t,k}^{-1}e_{t,k}.
+\]
+
+For a calibrated `r`-dimensional Gaussian model,
+
+\[
+\mathbb E[q_t]\approx r,
+\qquad
+\operatorname{Var}(q_t)\approx2r.
+\]
+
+A moment calibration penalty is
+
+\[
+\mathcal L_{\mathrm{cal}}=(\mathbb E[q_t]-r)^2+\lambda_q(\operatorname{Var}(q_t)-2r)^2.
+\]
+
+## 13. Training objective
+
+The auxiliary objective is
+
+\[
+\mathcal L_{\mathrm{aux}}=
+\lambda_{\mathrm{nll}}\mathcal L_{\mathrm{nll}}+
+\lambda_{\mathrm{mode}}\mathcal L_{\mathrm{mode}}+
+\lambda_{\mathrm{var}}\mathcal L_{\mathrm{var}}+
+\lambda_{\mathrm{decor}}\mathcal L_{\mathrm{decor}}+
+\lambda_{\mathrm{cal}}\mathcal L_{\mathrm{cal}}+
+\lambda_{\mathrm{orth}}\|W_p^{\top}W_p-I\|_F^2+
+\lambda_{\mathrm{energy}}\mathcal L_{\mathrm{residual}}.
+\]
+
+The complete objective is
+
+\[
+\mathcal L=\mathcal L_{\mathrm{task}}+\mathcal L_{\mathrm{aux}}.
+\]
+
+## 14. Stochastic stability bound
+
+Assume
+
+\[
+\sup_{t,k}\|A_{t,k}\|_2\le\alpha<1,
+\qquad
+\sup_{t,k}\operatorname{tr}(Q_{t,k})\le q_{\max}.
+\]
+
+Then
+
+\[
+\mathbb E\|s_t\|_2^2\le\alpha^2\mathbb E\|s_{t-1}\|_2^2+q_{\max}.
+\]
+
+Iterating,
+
+\[
+\mathbb E\|s_t\|_2^2\le\alpha^{2t}\mathbb E\|s_0\|_2^2+\frac{q_{\max}(1-\alpha^{2t})}{1-\alpha^2}.
+\]
+
+Therefore the latent second moment is uniformly bounded.
+
+## 15. Causality and chunk equivalence
+
+At token `t`, output depends only on `x_t`, the incoming state and learned parameters. The outgoing state is a deterministic function of those quantities. By induction, no future token affects a past output. Because the recurrence is Markovian in the explicit continuation state, processing adjacent chunks with state hand-off reproduces full-sequence evaluation under deterministic settings.
+
+## 16. Complexity
+
+For batch `B`, sequence length `T`, modes `K`, latent width `r`, rank `c`, and hidden width `d`:
+
+- projection and reconstruction: `O(BTdr)`;
+- mode propagation: `O(BTKrc)`;
+- Woodbury likelihoods: `O(BTK(rc^2+c^3))`;
+- continuation-state memory: `O(BK(r+rc))`.
+
+When `c << r`, correlated uncertainty is substantially cheaper than dense `r x r` covariance algebra.
+
+## 17. Falsifiability
+
+The mathematical contract guarantees causality, explicit state, probability normalisation, covariance positivity under the stated parameterisation, contractive deterministic transport, bounded latent second moments under bounded process noise and bounded residual intervention. It does not guarantee improved language modelling. That claim requires compute-matched experiments, ablations, confidence intervals and external task measurements.
