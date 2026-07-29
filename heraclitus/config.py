@@ -17,6 +17,9 @@ class HeraclitusConfig:
     observation_noise_floor: float = 1e-3
     initial_variance: float = 1.0
     shadow_scale: float = 0.25
+    shadow_context_scale: float = 0.20
+    shadow_weight_memory: float = 0.95
+    min_shadow_probability: float = 1e-3
     max_residual_scale: float = 0.10
     projection_norm_bound: float = 1.0
     reconstruction_norm_bound: float = 1.0
@@ -34,6 +37,10 @@ class HeraclitusConfig:
             raise ValueError("num_shadows must be at least 2")
         if not 0.0 <= self.min_retention < self.max_retention < 1.0:
             raise ValueError("retention bounds must satisfy 0 <= min < max < 1")
+        if not 0.0 <= self.shadow_weight_memory <= 1.0:
+            raise ValueError("shadow_weight_memory must lie in [0, 1]")
+        if not 0.0 <= self.min_shadow_probability < 1.0 / self.num_shadows:
+            raise ValueError("min_shadow_probability must lie in [0, 1 / num_shadows)")
         for name, value in (
             ("process_noise_floor", self.process_noise_floor),
             ("observation_noise_floor", self.observation_noise_floor),
@@ -46,5 +53,7 @@ class HeraclitusConfig:
         ):
             if value <= 0.0:
                 raise ValueError(f"{name} must be positive")
+        if self.shadow_context_scale < 0.0:
+            raise ValueError("shadow_context_scale must be nonnegative")
         if not 0.0 <= self.dropout < 1.0:
             raise ValueError("dropout must lie in [0, 1)")
