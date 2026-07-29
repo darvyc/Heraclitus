@@ -1,9 +1,12 @@
 """Public API for Heraclitus."""
 from .config import HeraclitusConfig
-from .parameter import HeraclitusDiagnostics, HeraclitusOutput, HeraclitusParameter
+from .parameter import (
+    HeraclitusAdapter,
+    HeraclitusDiagnostics,
+    HeraclitusOutput,
+    HeraclitusParameter,
+)
 from .state import HeraclitusState
-
-HeraclitusAdapter = HeraclitusParameter
 
 __all__ = [
     "HeraclitusAdapter",
