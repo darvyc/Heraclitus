@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "heraclitus"
-version = "1.0.0"
-description = "An experimental innovation-filtered low-rank state adapter with Gaussian predictive shadows."
+version = "2.0.0"
+description = "A multimodal predictive-state transformer parameter with stable higher-dimensional dynamics and low-rank correlated uncertainty."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.9"
@@ -15,14 +15,15 @@ keywords = [
     "large-language-model",
     "llm",
     "adapter",
-    "low-rank",
+    "predictive-state",
     "state-space",
-    "kalman-filter",
-    "gaussian-mixture",
+    "mixture-model",
+    "woodbury-identity",
+    "householder",
     "pytorch",
 ]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
