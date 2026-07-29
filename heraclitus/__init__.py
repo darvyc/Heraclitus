@@ -1,26 +1,32 @@
-"""Public API for the Heraclitus research prototype."""
-from .core import DualFlowTransformer
-from .counter_flow import CounterFlow
-from .network import FlowRegistry
-from .connections import FlowConnection
-from .direction import Direction
+"""Public API for Heraclitus."""
+from .config import HeraclitusConfig
 from .mathematics import (
-    expected_random_degree,
+    bounded_frobenius,
+    geodesic_fraction,
     orthogonal_procrustes,
-    random_alignment_probability,
-    threshold_for_expected_random_degree,
+    orthogonality_error,
+    safe_unit,
+    spherical_ema,
 )
+from .parameter import (
+    HeraclitusDiagnostics,
+    HeraclitusOutput,
+    HeraclitusParameter,
+)
+from .state import HeraclitusState
 
 __all__ = [
-    "DualFlowTransformer",
-    "CounterFlow",
-    "FlowRegistry",
-    "FlowConnection",
-    "Direction",
-    "random_alignment_probability",
-    "expected_random_degree",
-    "threshold_for_expected_random_degree",
+    "HeraclitusConfig",
+    "HeraclitusDiagnostics",
+    "HeraclitusOutput",
+    "HeraclitusParameter",
+    "HeraclitusState",
+    "bounded_frobenius",
+    "geodesic_fraction",
     "orthogonal_procrustes",
+    "orthogonality_error",
+    "safe_unit",
+    "spherical_ema",
 ]
 
-__version__ = "0.2.0"
+__version__ = "1.0.0"
