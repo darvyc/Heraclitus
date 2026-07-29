@@ -1,31 +1,6 @@
 # Heraclitus
 
-> *"πάντα ῥεῖ" - everything flows.*
->
-> *"The road up and the road down are one and the same."* - Heraclitus, Fragment 60
-
-Heraclitus is an experimental 3D Dual-Flow Transformer research prototype. It combines inline local adaptation, a sphere-valued state vector, direction-conditioned attention, similarity-based peer discovery, and frozen prior-state snapshots called Counter-Flows.
-
-## Research status
-
-This repository is not a validated learning method. It currently provides mechanisms and mathematical diagnostics that must still be tested against task-level objectives, strong baselines, repeated seeds, uncertainty estimates, and ablations.
-
-Read `docs/MATHEMATICAL_AUDIT.md` before treating any architectural claim as established. That document states what the model now implements, what was mathematically defective in the initial version, and what remains absent.
-
-## Core mechanisms
-
-| Mechanism | Current implementation |
-|---|---|
-| Forward adaptation | A bounded multi-output Oja update on the attention output projection and a local squared-error descent step on the MLP output bias. |
-| 3D state | Each transformer carries a unit vector `d` on `S^2`, updated from pooled hidden features through a registry-shared projection frame. |
-| Direction-conditioned attention | Each key token receives a direction-dependent logit bias that varies along the softmax axis. |
-| Peer discovery | A `FlowRegistry` finds peers above a cosine threshold and exposes an exact random-alignment null model for threshold calibration. |
-| Counter-Flow | Each update stores a clean, frozen prior model clone without recursively copying the registry or earlier snapshots. |
-| Frame alignment | An orthogonal Procrustes utility aligns 3D frames from shared anchor observations. |
-
-## Important limitations
-
-Connections currently record graph edges but do not exchange activations or messages. Counter-Flows provide frozen targets but are not yet included in an explicit regularisation objective. A shared projection frame does not by itself guarantee that independently trained hidden spaces have the same semantic basis. Three dimensions may be too severe a bottleneck.
+Heraclitus is a causal, state-conditioned, low-rank parameter for transformer language models. It adds a bounded adaptive residual to an existing hidden stream while preserving standard gradient training, explicit sequence state, chunked generation, masking, mixed precision, and model serialisation.
 
 ## Install
 
@@ -33,43 +8,72 @@ Connections currently record graph edges but do not exchange activations or mess
 pip install -e .
 ```
 
-Requires Python 3.9 or later and PyTorch 2.0 or later.
+Heraclitus requires Python 3.9 or later and PyTorch 2.0 or later.
 
-## Quickstart
+## LLM integration
 
 ```python
 import torch
-from heraclitus import DualFlowTransformer, FlowRegistry
+from heraclitus import HeraclitusConfig, HeraclitusParameter
 
-registry = FlowRegistry(frame_seed=7)
-nets = [
-    DualFlowTransformer(d_model=64, n_heads=4, n_layers=2, registry=registry)
-    for _ in range(3)
-]
+hidden_size = 4096
+heraclitus = HeraclitusParameter(
+    HeraclitusConfig(
+        hidden_size=hidden_size,
+        state_size=64,
+        max_residual_scale=0.10,
+    )
+)
 
-x = torch.randn(2, 16, 64)
-for net in nets:
-    y = net(x, learn=True)
+hidden_states = torch.randn(2, 128, hidden_size)
+attention_mask = torch.ones(2, 128, dtype=torch.bool)
 
-# Calibrate a threshold to one expected random match in this registry.
-threshold = registry.threshold_for_null_degree(expected_degree=1.0)
-for net in nets:
-    net.scan_and_connect(threshold=threshold)
+result = heraclitus.forward_with_state(
+    hidden_states,
+    attention_mask=attention_mask,
+)
 
-print(nets[0].counter_flow.summary())
+hidden_states = result.hidden_states
+auxiliary_loss = result.regularization_loss()
 ```
 
-## Repository layout
+Place one `HeraclitusParameter` after the attention residual, after the MLP residual, or once at the end of each transformer block. Its input and output both have shape `(batch, sequence, hidden_size)`.
+
+## Stateful generation
+
+```python
+state = None
+outputs = []
+
+for hidden_chunk in hidden_chunks:
+    result = heraclitus.forward_with_state(hidden_chunk, state=state)
+    outputs.append(result.hidden_states)
+    state = result.state
+```
+
+The continuation state contains one live flow, one counter-flow, and one valid-token counter per sequence. It can be detached, cloned, moved between devices, converted to a tensor dictionary, saved, and restored for continued generation.
+
+## Mathematical contract
+
+For hidden width `D` and state width `R`, Heraclitus uses exactly:
 
 ```text
-heraclitus/
-├── heraclitus/
-├── examples/
-├── tests/
-└── docs/
-    ├── ARCHITECTURE.md
-    └── MATHEMATICAL_AUDIT.md
+2 * D * R + R + 3
 ```
+
+trainable scalar parameters. Runtime state uses `2 * B * R + B` scalars for batch size `B`.
+
+The parameter satisfies these invariants:
+
+- Strict causality: output token `t` depends only on tokens `0` through `t` and state accumulated before `t`.
+- Batch isolation: one sequence cannot alter another sequence's state.
+- Unit state: live flow and counter-flow remain on the unit sphere.
+- Bounded adaptation: effective projection and reconstruction matrices are constrained to norm balls and residual gain is bounded.
+- Autograd safety: forward execution never mutates trainable parameters.
+- Chunk equivalence: processing a sequence in chunks with the returned state matches processing it in one call when dropout is disabled.
+- Mask correctness: masked tokens are unchanged and do not advance state.
+
+The full equations, bounds, and proof sketches are in `docs/MATHEMATICS.md`. Integration patterns are in `docs/INTEGRATION.md`.
 
 ## Testing
 
@@ -77,7 +81,7 @@ heraclitus/
 pytest -q
 ```
 
-The mathematical regression tests verify that direction changes attention, the shared frame is actually shared, the predictive update descends its declared local error, antipodal sphere interpolation is finite, Procrustes alignment recovers a known rotation, and Counter-Flow snapshots do not recursively copy registry history.
+The test suite verifies causality, chunk equivalence, batch isolation, gradients, masking, mixed precision, serialisation, state geometry, bounded matrices, and mathematical utilities.
 
 ## License
 
