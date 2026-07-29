@@ -1,114 +1,131 @@
-# Heraclitus — Architecture
+# Heraclitus Architecture
 
-> *"The road up and the road down are one and the same."* — Heraclitus, Fragment 60
+This document describes the mechanisms implemented by the current research prototype. It does not claim that those mechanisms improve task performance. See `MATHEMATICAL_AUDIT.md` for the critical assessment, formal assumptions, unresolved problems, and minimum experimental standard.
 
-This document describes the four behaviours required of a Dual-Flow Transformer
-and how each maps onto the modules in this repository.
+## 1. Direction-conditioned attention
 
-## 1. Forward-pass learning
+Each block begins with ordinary scaled dot-product attention. For batch b, head h, query token i, and key token j:
 
-The transformer adapts its parameters during the forward pass, with no
-backward pass required. Two local, gradient-free rules are applied at each
-block during `forward(..., learn=True)`:
+    base_score[b,h,i,j] = q[b,h,i] dot k[b,h,j] / sqrt(d_head)
 
-* **Hebbian update** on the attention output projection
-  `W_o`: `ΔW ∝ ⟨post · preᵀ⟩ / N`, normalised so a single update cannot
-  destabilise the weight scale (`forward_learner.py::hebbian_update`).
-* **Predictive-coding update** on the MLP output bias: each block keeps an
-  EMA of its recent output; the difference between the current output and the
-  EMA — the "surprise" — drives an additive bias correction
-  (`forward_learner.py::predictive_update`).
+Each key token is also mapped to a learned unit 3-vector `a[b,h,j]`. Given the model's live unit direction `d`, the final score is:
 
-Because both rules use only locally available statistics and run inside
-`torch.no_grad()`, a `DualFlowTransformer` can be embedded inside a normal
-autograd graph without interfering with it. Setting `learn=False` reduces the
-module to a vanilla transformer.
+    score[b,h,i,j] = base_score[b,h,i,j]
+                       + direction_scale[h] * a[b,h,j] dot d
 
-## 2. The 3D direction vector
+The directional term varies over key index j, which is the softmax normalisation axis. This is essential. Adding one constant to an entire attention row would have no effect because softmax is translation-invariant.
 
-Each transformer carries a single learned unit vector `d ∈ S²` representing
-the orientation of its current hypothesis in a shared latent space.
+The merged attention context is returned internally so the local update for the output projection uses the tensor that actually enters that projection.
 
-* `direction.py` provides the S² utilities (`random`, `normalize`, `cosine`,
-  `angle`, `slerp`, `from_features`).
-* `core.py` holds the live direction in a registered buffer and updates it
-  via momentum-EMA after every learning forward pass:
-  `d ← normalize(m · d + (1 − m) · target)`,
-  where `target = normalize(mean(features) · W_dir)`.
-* The same direction also modulates attention: in
-  `attention.py::DirectionModulatedAttention` each head carries a learned
-  3-axis, and the head's attention logits receive an additive bias equal to
-  the dot product of that axis with the live direction. This means the
-  transformer's S² orientation continuously shapes what it attends to,
-  without re-allocating any structural capacity.
+## 2. Local forward adaptation
 
-## 3. Scanning and connection
+When `forward(..., learn=True)` is called, each block applies two updates under `torch.no_grad()`.
 
-After each update the transformer can scan the shared `FlowRegistry` for
-peers whose direction now lies inside its alignment cone, and forge weighted
-`FlowConnection`s with them.
+### Attention output projection
 
-* `network.py::FlowRegistry` is an in-process directory of every live
-  transformer. Its `query_aligned(d, threshold)` method returns peers whose
-  cosine with `d` exceeds the threshold, sorted by descending alignment.
-* `core.py::DualFlowTransformer.scan_and_connect()` calls the registry,
-  builds `FlowConnection` records (with weight = cosine at forge-time and a
-  snapshot of the source's direction for audit), and stores them on the
-  transformer's `.connections` dict.
-* The `top_k` and `replace` flags let callers cap the fan-out and decide
-  whether each scan augments or rebuilds the connection set.
+For the output projection `y = W x`, the code uses a bounded multi-output Oja rule:
 
-The registry is intentionally a brute-force dict; a kd-tree or HNSW index
-could be substituted without changing the public API.
+    Delta W = E[y x^T] - diag(E[y^2]) W
 
-## 4. The Counter-Flow
+The Oja term opposes unconstrained Hebbian norm growth. The resulting parameter displacement is clipped to a configured fraction of the current weight norm.
 
-Before any update, the transformer's prior incarnation is frozen as a
-`CounterFlow` derivative — a backwards-pointing shadow.
+### MLP output bias
 
-* `counter_flow.py::CounterFlowSnapshot` records `{step, direction,
-  state_dict, connection_ids, metadata}`.
-* `CounterFlow` wraps that snapshot together with a deep-copied,
-  parameter-frozen replica of the parent module. It exposes:
-    - `direction` — the prior S² orientation;
-    - `distillation_target(x)` — runs the frozen prior on `x` for use as a
-      soft target / regulariser;
-    - `opposition(live_direction)` — geodesic angle on S² between the live
-      direction and this past one, a scalar measure of how sharp the most
-      recent revision was;
-    - `summary()` — a one-line audit string.
-* The transformer keeps a bounded chain of Counter-Flows
-  (`keep_counter_flows`); the most recent is exposed as `.counter_flow` and
-  the full chain as `.counter_flows`.
+Let `y_bar` be the current mean output and `m` its exponential moving target. The local additive-bias update is:
 
-Together, the live network and the chain of Counter-Flows realise the
-Heraclitean image: the river flows forward, while every prior moment of the
-same river is preserved, frozen, and addressable.
+    b_next = b - eta * (y_bar - m)
+    m_next = rho * m + (1 - rho) * y_bar
 
-## Module map
+The subtraction sign follows gradient descent on local squared prediction error.
 
-```
+These are local adaptation rules. They are not a substitute for a task-level objective, and the repository does not presently contain a convergence theorem for the coupled dynamics.
+
+## 3. Sphere-valued state
+
+Each transformer stores a unit direction `d` on `S^2`.
+
+A projection frame `P` with shape `(d_model, 3)` maps pooled hidden features to a target direction:
+
+    target = normalise(mean(features) P)
+
+The state update is:
+
+    d_next = normalise(momentum * d + (1 - momentum) * target)
+
+Transformers in the same `FlowRegistry` and with the same hidden width receive the same orthonormal projection frame. This removes the obvious error of comparing coordinates produced by independently rotated 3D frames.
+
+A shared projection frame does not guarantee semantic comparability when hidden feature spaces themselves are unaligned. The `orthogonal_procrustes` utility can fit a proper 3D rotation from shared anchor observations, but users must still supply and validate those anchors.
+
+## 4. Peer discovery and null calibration
+
+`FlowRegistry.query_aligned` returns peers satisfying:
+
+    d_source dot d_target >= threshold
+
+For independent uniform directions on `S^2`:
+
+    P(random match) = (1 - threshold) / 2
+
+With N registry members, the expected random out-degree is:
+
+    (N - 1) * (1 - threshold) / 2
+
+The registry exposes both this null expectation and its inverse threshold calculation. A reported threshold is scientifically incomplete unless registry size and the implied random degree are also reported.
+
+Connections are currently records only. They do not transmit activations, aggregate messages, or alter predictions.
+
+## 5. Counter-Flow snapshots
+
+Before a local update, the model stores:
+
+- step number
+- previous direction
+- cloned state dictionary
+- connection identifiers
+- metadata
+- a clean frozen architecture clone for distillation queries
+
+The frozen clone is created without a registry and without historical Counter-Flows. This prevents recursive copying of the swarm and its snapshot history.
+
+Retaining K full snapshots of a P-parameter model still costs O(KP) storage. Delta checkpoints or low-rank parameter differences are required for scale.
+
+Counter-Flows are not yet included in an explicit regularisation term. At present they provide auditability and a callable frozen target, not a complete dual-flow optimisation law.
+
+## 6. Module map
+
+```text
 heraclitus/
-├── core.py              DualFlowTransformer (the headline module)
-├── attention.py         DirectionModulatedAttention
-├── forward_learner.py   ForwardLearner (Hebbian + predictive-coding rules)
-├── direction.py         Direction (S² utilities)
-├── counter_flow.py      CounterFlow + CounterFlowSnapshot
-├── network.py           FlowRegistry
-├── connections.py       FlowConnection
-└── utils.py             new_flow_id
+├── core.py              DualFlowTransformer and update lifecycle
+├── attention.py         key-dependent direction-conditioned attention
+├── forward_learner.py   bounded Oja and local prediction-error updates
+├── direction.py         stable S^2 geometry
+├── mathematics.py       null model and Procrustes frame alignment
+├── counter_flow.py      frozen snapshots
+├── network.py           registry, shared frame, calibrated search
+├── connections.py       directed edge records
+└── utils.py             identifiers
 ```
 
-## Lifecycle of one update
+## 7. Update lifecycle
 
 1. `net(x, learn=True)` is called.
-2. `_snapshot_counter_flow()` deep-copies the current state into a new
-   `CounterFlow` and appends it to `net.counter_flows`.
-3. The stack runs. For each block, after the standard attention + MLP, the
-   Hebbian and predictive-coding rules update `W_o` and the MLP bias in place.
-4. `_update_direction(out)` slides the live S² direction toward the
-   projection of the latest features.
-5. `net.step` is incremented.
-6. The caller invokes `net.scan_and_connect(threshold=...)`. The registry is
-   queried, new `FlowConnection`s are forged, and the connection map is
-   updated.
+2. A clean frozen Counter-Flow snapshot is created from the pre-update state.
+3. Each transformer block computes attention and MLP outputs.
+4. The attention output projection receives the bounded Oja update using its true input and output activities.
+5. The MLP output bias descends its local prediction error.
+6. The final hidden features update the unit direction through the shared frame.
+7. The step counter increments.
+8. A caller may scan the registry and create similarity-edge records using a calibrated threshold.
+
+## 8. Non-claims
+
+The current code does not establish that:
+
+- three dimensions preserve useful model-state information
+- direction cosine measures hypothesis similarity
+- local updates improve any task
+- Counter-Flows prevent forgetting
+- graph connections enable cooperation
+- the coupled dynamics converge
+
+Those questions require the experiments and baselines specified in `MATHEMATICAL_AUDIT.md`.
