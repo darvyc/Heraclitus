@@ -121,9 +121,46 @@ def test_regularization_and_diagnostics_are_finite():
     for value in vars(result.diagnostics).values():
         assert torch.isfinite(value)
     assert float(result.diagnostics.next_best_shadow_probability.detach()) >= 0.0
+    assert 1.0 <= float(result.diagnostics.effective_shadows.detach()) <= 4.0 + 1e-5
 
 
-def test_invalid_shapes_are_rejected():
+def test_predictive_distribution_is_normalised_and_positive():
+    module = make_parameter().eval()
+    state = module.forward_with_state(torch.randn(2, 3, 12)).state
+    means, variance, probabilities = module.predictive_distribution(state)
+    assert means.shape == (2, 4, 4)
+    assert variance.shape == (2, 4)
+    assert probabilities.shape == (2, 4)
+    assert torch.all(variance > 0)
+    assert torch.all(probabilities >= 0)
+    assert torch.allclose(probabilities.sum(dim=-1), torch.ones(2), atol=1e-6)
+
+
+def test_shadow_probability_floor_prevents_dead_components():
+    module = make_parameter().eval()
+    result = module.forward_with_state(torch.randn(2, 8, 12) * 100.0)
+    probabilities = result.state.shadow_log_weights.exp()
+    assert torch.all(probabilities >= module.config.min_shadow_probability - 1e-7)
+    assert torch.allclose(probabilities.sum(dim=-1), torch.ones(2), atol=1e-6)
+
+
+def test_context_changes_shadow_geometry():
+    module = make_parameter().eval()
+    with torch.no_grad():
+        module.shadow_context.normal_(mean=0.0, std=0.2)
+    state_a = module.initial_state(1)
+    state_b = type(state_a)(
+        mean=torch.ones_like(state_a.mean),
+        variance=state_a.variance,
+        shadow_log_weights=state_a.shadow_log_weights,
+        steps=state_a.steps,
+    )
+    means_a, _, _ = module.predictive_distribution(state_a)
+    means_b, _, _ = module.predictive_distribution(state_b)
+    assert not torch.allclose(means_a, means_b)
+
+
+def test_invalid_shapes_and_configuration_are_rejected():
     module = make_parameter()
     with pytest.raises(ValueError):
         module(torch.randn(2, 12))
@@ -131,6 +168,8 @@ def test_invalid_shapes_are_rejected():
         module(torch.randn(2, 5, 11))
     with pytest.raises(ValueError):
         module(torch.randn(2, 5, 12), attention_mask=torch.ones(2, 4))
+    with pytest.raises(ValueError):
+        HeraclitusConfig(hidden_size=12, state_size=4, min_shadow_probability=0.25)
 
 
 def test_runtime_state_is_reorderable_and_checkpointable():
