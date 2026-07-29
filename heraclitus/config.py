@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 
 @dataclass(frozen=True)
@@ -27,13 +28,14 @@ class HeraclitusConfig:
     covariance_factor_scale: float = 0.05
     dropout: float = 0.0
     epsilon: float = 1e-6
-
-    @property
-    def num_shadows(self) -> int:
-        """Compatibility alias for 1.x callers."""
-        return self.num_modes
+    num_shadows: Optional[int] = None
 
     def __post_init__(self) -> None:
+        if self.num_shadows is not None:
+            if self.num_modes != 4 and self.num_modes != self.num_shadows:
+                raise ValueError("num_modes and num_shadows disagree")
+            object.__setattr__(self, "num_modes", self.num_shadows)
+        object.__setattr__(self, "num_shadows", self.num_modes)
         if self.hidden_size < 1:
             raise ValueError("hidden_size must be positive")
         if not 2 <= self.state_size <= self.hidden_size:
