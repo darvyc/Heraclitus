@@ -66,6 +66,8 @@ line-length = 100
 select = ["B", "E", "F", "I", "UP"]
 
 [tool.mypy]
-python_version = "3.9"
+# Current typed PyTorch sources use Python 3.10 syntax. Python 3.9 runtime
+# compatibility is exercised directly by the CI matrix and Ruff's py39 target.
+python_version = "3.10"
 strict = true
 packages = ["heraclitus"]
