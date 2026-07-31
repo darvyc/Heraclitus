@@ -36,6 +36,8 @@ class HeraclitusState:
             raise ValueError("steps must have shape (batch_size,) and dtype torch.long")
         if len({self.memory.device, self.usage.device, self.steps.device}) != 1:
             raise ValueError("all state tensors must share a device")
+        if not self.memory.is_floating_point() or not self.usage.is_floating_point():
+            raise ValueError("memory and usage must be floating-point tensors")
         if not torch.isfinite(self.memory).all() or not torch.isfinite(self.usage).all():
             raise ValueError("state contains non-finite values")
 
