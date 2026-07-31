@@ -60,8 +60,8 @@ class HeraclitusAdapter(nn.Module):
     """Add compact, explicit recurrent memory to transformer hidden states.
 
     Computation is performed in float32 even when the module parameters or host
-    hidden stream use reduced precision. Every residual is projected onto a
-    per-token norm ball before it is added to the host stream.
+    hidden stream use reduced precision. Every returned residual is verified in
+    the host dtype against a strict per-token norm bound.
     """
 
     def __init__(self, config: HeraclitusConfig):
@@ -157,6 +157,8 @@ class HeraclitusAdapter(nn.Module):
         batch, sequence, hidden = hidden_states.shape
         if hidden != self.config.hidden_size or sequence < 1:
             raise ValueError("hidden size mismatch or empty sequence")
+        if hidden_states.dtype not in {torch.float32, torch.float16, torch.bfloat16}:
+            raise ValueError("hidden_states must use float32, float16 or bfloat16")
         if not torch.isfinite(hidden_states).all():
             raise ValueError("hidden_states contains non-finite values")
 
@@ -194,14 +196,14 @@ class HeraclitusAdapter(nn.Module):
             read, read_weights = self._read(token, memory)
             raw_delta = self._linear(read, self.output)
             raw_delta = self.dropout(raw_delta) * residual_gate
-            delta, token_residual_ratio = self._bound_residual(raw_delta, token_source)
+            delta, _ = self._bound_residual(raw_delta, token_source)
             delta = torch.where(valid, delta, torch.zeros_like(delta))
-            token_residual_ratio = torch.where(
-                valid.squeeze(-1),
-                token_residual_ratio,
-                torch.zeros_like(token_residual_ratio),
+            token_output, actual_delta, token_residual_ratio = self._quantize_bounded_output(
+                token_source,
+                delta,
+                hidden_states.dtype,
             )
-            outputs.append(token_source + delta)
+            outputs.append(token_output)
 
             controller = torch.cat([token, read], dim=-1)
             candidate = torch.tanh(self._linear(controller, self.candidate))
@@ -228,16 +230,20 @@ class HeraclitusAdapter(nn.Module):
             read_entropies.append(self._mask_scalar(read_entropy, valid))
             write_entropies.append(self._mask_scalar(write_entropy, valid))
             write_rates.append(self._mask_scalar(write_rate.squeeze(-1), valid))
-            residual_energies.append(self._mask_scalar(delta.square().mean(dim=-1), valid))
+            residual_energies.append(
+                self._mask_scalar(actual_delta.square().mean(dim=-1), valid)
+            )
             write_energies.append(
                 self._mask_scalar(
                     (amount * candidate.unsqueeze(1)).square().mean(dim=(1, 2)),
                     valid,
                 )
             )
-            residual_ratios.append(token_residual_ratio)
+            residual_ratios.append(
+                self._mask_scalar(token_residual_ratio, valid)
+            )
 
-        output = torch.stack(outputs, dim=1).to(hidden_states.dtype)
+        output = torch.stack(outputs, dim=1)
         final_state = HeraclitusState(memory, usage, steps)
         if detach_state:
             final_state = final_state.detach()
@@ -335,6 +341,41 @@ class HeraclitusAdapter(nn.Module):
         ratio = bounded.norm(dim=-1) / source_norm.squeeze(-1).clamp_min(self.config.epsilon)
         ratio = torch.where(source_norm.squeeze(-1) > 0.0, ratio, torch.zeros_like(ratio))
         return bounded, ratio
+
+    def _quantize_bounded_output(
+        self,
+        source: Tensor,
+        delta: Tensor,
+        output_dtype: torch.dtype,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Quantize, re-check, and enforce the residual bound in the host dtype."""
+        output = (source + delta).to(output_dtype)
+        source_output = source.to(output_dtype)
+        source_norm = source.norm(dim=-1, keepdim=True)
+        bound = self.config.max_residual_ratio * source_norm
+
+        for _ in range(4):
+            observed = output.float() - source
+            observed_norm = observed.norm(dim=-1, keepdim=True)
+            violating = observed_norm > bound
+            scale = (0.98 * bound / observed_norm.clamp_min(self.config.epsilon)).clamp(
+                max=1.0
+            )
+            revised = observed * scale
+            candidate = (source + revised).to(output_dtype)
+            output = torch.where(violating, candidate, output)
+
+        observed = output.float() - source
+        observed_norm = observed.norm(dim=-1, keepdim=True)
+        violating = observed_norm > bound
+        output = torch.where(violating, source_output, output)
+
+        actual_delta = output.float() - source
+        ratio = actual_delta.norm(dim=-1) / source_norm.squeeze(-1).clamp_min(
+            self.config.epsilon
+        )
+        ratio = torch.where(source_norm.squeeze(-1) > 0.0, ratio, torch.zeros_like(ratio))
+        return output, actual_delta, ratio
 
     def _retention(self) -> Tensor:
         return self.config.min_retention + (
