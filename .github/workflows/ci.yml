@@ -9,6 +9,19 @@ permissions:
   contents: read
 
 jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[dev]"
+      - run: ruff check .
+      - run: mypy heraclitus
+
   test:
     runs-on: ubuntu-latest
     strategy:
@@ -23,9 +36,10 @@ jobs:
           cache: pip
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e ".[dev]"
-      - run: ruff check .
-      - run: mypy heraclitus
       - run: pytest --cov=heraclitus --cov-report=term-missing
+      - run: python examples/basic_usage.py
+      - run: python examples/llm_parameter.py
+      - run: python examples/benchmark_adapter.py --hidden-size 32 --state-size 8 --memory-slots 4 --num-heads 2 --write-topk 1 --sequence-length 8 --iterations 1 --activate-output
       - run: python -m compileall -q heraclitus
 
   package:
