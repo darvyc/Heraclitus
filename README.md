@@ -2,11 +2,9 @@
 
 Heraclitus is a bounded recurrent slot-memory adapter for transformer hidden states. It carries a small explicit state across chunks, retrieves from that state through multi-head content attention, and writes sparse updates selected by novelty and recent usage.
 
-Version 3.0.0 is a clean architecture release. Earlier Gaussian-shadow, covariance-filter, and live/counter-flow specifications are not part of this implementation.
-
 ## Status
 
-Heraclitus is a research beta. Its causal, numerical, state-management, and residual-bound contracts are tested. Improved language-model quality is not claimed without task-level, compute-matched evaluation.
+Heraclitus is a research beta. Its causal, numerical, state-management, and residual-bound contracts are tested. 
 
 ## Install
 
