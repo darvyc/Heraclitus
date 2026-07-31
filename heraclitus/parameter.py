@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -34,7 +33,7 @@ class HeraclitusOutput:
 
     hidden_states: Tensor
     state: HeraclitusState
-    regularization: Dict[str, Tensor]
+    regularization: dict[str, Tensor]
     diagnostics: HeraclitusDiagnostics
 
     def regularization_loss(
@@ -108,7 +107,7 @@ class HeraclitusAdapter(nn.Module):
     def initial_state(
         self,
         batch_size: int,
-        device: Optional[torch.device] = None,
+        device: torch.device | None = None,
     ) -> HeraclitusState:
         if batch_size < 1:
             raise ValueError("batch_size must be positive")
@@ -125,14 +124,14 @@ class HeraclitusAdapter(nn.Module):
         steps = torch.zeros(batch_size, dtype=torch.long, device=target)
         return HeraclitusState(memory, usage, steps)
 
-    def forward(self, hidden_states: Tensor, attention_mask: Optional[Tensor] = None) -> Tensor:
+    def forward(self, hidden_states: Tensor, attention_mask: Tensor | None = None) -> Tensor:
         return self.forward_with_state(hidden_states, attention_mask=attention_mask).hidden_states
 
     def forward_step(
         self,
         hidden_state: Tensor,
-        state: Optional[HeraclitusState] = None,
-        valid: Optional[Tensor] = None,
+        state: HeraclitusState | None = None,
+        valid: Tensor | None = None,
         detach_state: bool = True,
     ) -> HeraclitusOutput:
         """Process one token per batch element."""
@@ -149,8 +148,8 @@ class HeraclitusAdapter(nn.Module):
     def forward_with_state(
         self,
         hidden_states: Tensor,
-        state: Optional[HeraclitusState] = None,
-        attention_mask: Optional[Tensor] = None,
+        state: HeraclitusState | None = None,
+        attention_mask: Tensor | None = None,
         detach_state: bool = True,
     ) -> HeraclitusOutput:
         if hidden_states.ndim != 3:
@@ -289,7 +288,7 @@ class HeraclitusAdapter(nn.Module):
             ),
         )
 
-    def _read(self, token: Tensor, memory: Tensor) -> Tuple[Tensor, Tensor]:
+    def _read(self, token: Tensor, memory: Tensor) -> tuple[Tensor, Tensor]:
         batch = token.shape[0]
         heads = self.config.num_heads
         head_size = self.config.state_size // heads
@@ -324,7 +323,7 @@ class HeraclitusAdapter(nn.Module):
             logits = sparse_logits
         return logits.softmax(dim=-1)
 
-    def _bound_residual(self, delta: Tensor, source: Tensor) -> Tuple[Tensor, Tensor]:
+    def _bound_residual(self, delta: Tensor, source: Tensor) -> tuple[Tensor, Tensor]:
         source_norm = source.norm(dim=-1, keepdim=True)
         delta_norm = delta.norm(dim=-1, keepdim=True)
         bound = self.config.max_residual_ratio * source_norm
@@ -364,7 +363,7 @@ class HeraclitusAdapter(nn.Module):
 
     @staticmethod
     def _normalise_mask(
-        mask: Optional[Tensor],
+        mask: Tensor | None,
         batch: int,
         sequence: int,
         device: torch.device,
