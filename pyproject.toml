@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "heraclitus"
-version = "1.0.0"
-description = "A bounded recurrent memory adapter for transformer hidden states."
+version = "3.0.0"
+description = "A bounded recurrent slot-memory adapter for transformer hidden states."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.9"
@@ -21,7 +21,7 @@ keywords = [
     "pytorch",
 ]
 classifiers = [
-    "Development Status :: 5 - Production/Stable",
+    "Development Status :: 4 - Beta",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
