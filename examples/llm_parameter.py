@@ -1,8 +1,6 @@
 """Stateful insertion of Heraclitus 3 into a transformer residual stream."""
 from __future__ import annotations
 
-from typing import Optional, Tuple
-
 import torch
 from torch import Tensor, nn
 
@@ -33,9 +31,9 @@ class ExampleTransformerBlock(nn.Module):
     def forward(
         self,
         hidden_states: Tensor,
-        state: Optional[HeraclitusState] = None,
-        attention_mask: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, HeraclitusState]:
+        state: HeraclitusState | None = None,
+        attention_mask: Tensor | None = None,
+    ) -> tuple[Tensor, HeraclitusState]:
         sequence_length = hidden_states.shape[1]
         causal_mask = torch.triu(
             torch.ones(
