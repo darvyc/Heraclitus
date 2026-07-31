@@ -1,4 +1,4 @@
-# Heraclitus 3
+# Heraclitus 
 
 Heraclitus is a bounded recurrent slot-memory adapter for transformer hidden states. It carries a small explicit state across chunks, retrieves from that state through multi-head content attention, and writes sparse updates selected by novelty and recent usage.
 
