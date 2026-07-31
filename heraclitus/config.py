@@ -12,12 +12,16 @@ class HeraclitusConfig:
     state_size: int = 128
     memory_slots: int = 8
     num_heads: int = 4
-    min_retention: float = 0.90
-    max_retention: float = 0.9995
+    min_retention: float = 0.99
+    max_retention: float = 0.99995
+    initial_retention: float = 0.999
     max_write_rate: float = 0.25
-    max_residual_scale: float = 0.10
+    max_residual_ratio: float = 0.10
     usage_decay: float = 0.995
+    max_usage: float = 64.0
     usage_penalty: float = 0.10
+    write_temperature: float = 0.25
+    write_topk: int = 2
     dropout: float = 0.0
     epsilon: float = 1e-6
 
@@ -30,16 +34,24 @@ class HeraclitusConfig:
             raise ValueError("memory_slots must be positive")
         if self.num_heads < 1 or self.state_size % self.num_heads:
             raise ValueError("num_heads must divide state_size")
-        if not 0.0 <= self.min_retention < self.max_retention <= 1.0:
-            raise ValueError("retention bounds must satisfy 0 <= min < max <= 1")
+        if not 0.0 <= self.min_retention < self.max_retention < 1.0:
+            raise ValueError("retention bounds must satisfy 0 <= min < max < 1")
+        if not self.min_retention <= self.initial_retention <= self.max_retention:
+            raise ValueError("initial_retention must lie within the retention bounds")
         if not 0.0 < self.max_write_rate <= 1.0:
             raise ValueError("max_write_rate must lie in (0, 1]")
-        if not 0.0 < self.max_residual_scale <= 1.0:
-            raise ValueError("max_residual_scale must lie in (0, 1]")
-        if not 0.0 < self.usage_decay <= 1.0:
-            raise ValueError("usage_decay must lie in (0, 1]")
+        if not 0.0 < self.max_residual_ratio <= 1.0:
+            raise ValueError("max_residual_ratio must lie in (0, 1]")
+        if not 0.0 < self.usage_decay < 1.0:
+            raise ValueError("usage_decay must lie in (0, 1)")
+        if self.max_usage <= 0.0:
+            raise ValueError("max_usage must be positive")
         if self.usage_penalty < 0.0:
             raise ValueError("usage_penalty must be non-negative")
+        if self.write_temperature <= 0.0:
+            raise ValueError("write_temperature must be positive")
+        if not 1 <= self.write_topk <= self.memory_slots:
+            raise ValueError("write_topk must lie in [1, memory_slots]")
         if not 0.0 <= self.dropout < 1.0:
             raise ValueError("dropout must lie in [0, 1)")
         if self.epsilon <= 0.0:
