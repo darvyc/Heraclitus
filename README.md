@@ -1,8 +1,12 @@
-# Heraclitus
+# Heraclitus 3
 
-Heraclitus is a bounded recurrent memory adapter for transformer hidden states. It compresses prior activations into a small, explicit slot bank that continues across chunks, retrieves relevant state through multi-head content attention, and writes new information through novelty and usage-aware gated updates.
+Heraclitus is a bounded recurrent slot-memory adapter for transformer hidden states. It carries a small explicit state across chunks, retrieves from that state through multi-head content attention, and writes sparse updates selected by novelty and recent usage.
 
-Heraclitus is designed for streaming inference, recurrent context compression, stateful agents, and controlled experiments in context extension. It is causal, batch-isolated, serialisable, reorderable for beam search, and safe to attach to a pretrained model as an exact no-op.
+Version 3.0.0 is a clean architecture release. Earlier Gaussian-shadow, covariance-filter, and live/counter-flow specifications are not part of this implementation.
+
+## Status
+
+Heraclitus is a research beta. Its causal, numerical, state-management, and residual-bound contracts are tested. Improved language-model quality is not claimed without task-level, compute-matched evaluation.
 
 ## Install
 
@@ -24,11 +28,12 @@ adapter = HeraclitusAdapter(
         state_size=128,
         memory_slots=8,
         num_heads=4,
+        write_topk=2,
     )
 )
 
-hidden = torch.randn(2, 256, 4096)
-first = adapter.forward_with_state(hidden)
+first_hidden = torch.randn(2, 256, 4096)
+first = adapter.forward_with_state(first_hidden)
 
 next_hidden = torch.randn(2, 128, 4096)
 continued = adapter.forward_with_state(next_hidden, state=first.state)
@@ -36,51 +41,35 @@ continued = adapter.forward_with_state(next_hidden, state=first.state)
 loss = task_loss + continued.regularization_loss()
 ```
 
-## Memory contract
+## Token transition
 
-For each valid token, Heraclitus performs five operations:
+For each valid token, Heraclitus:
 
-1. normalise the host hidden state;
-2. retrieve a multi-head content-addressed summary from persistent slots;
-3. add a bounded residual correction to the host stream;
-4. allocate a bounded write using novelty and decayed slot usage;
-5. return the adapted hidden state and explicit continuation state.
+1. RMS-normalises the host hidden state in float32.
+2. Retrieves a multi-head content-addressed summary from persistent memory.
+3. Forms a residual and projects it onto a strict per-token norm ball.
+4. Forms a new memory candidate from both the current token and retrieved memory.
+5. Selects at most `write_topk` slots using novelty and decayed usage.
+6. Applies a bounded erase-and-add update.
+7. Returns the adapted hidden state and explicit continuation state.
 
-Let `h_t` be the current hidden state, `M_t` the slot bank, and `u_t` slot usage.
+The residual contract is:
 
 ```text
-q_t = W_q RMSNorm(h_t)
-K_t = W_k M_t
-V_t = W_v M_t
-A_t = softmax(q_t K_t^T / sqrt(head_size))
-r_t = concat_heads(A_t V_t)
-
-h'_t = h_t + alpha W_o r_t
-
-c_t = tanh(W_c RMSNorm(h_t))
-novelty_i = 1 - cosine(c_t, M_ti)
-allocation = softmax(novelty - usage_penalty * normalised_usage)
-write_rate = max_write_rate * sigmoid(W_g [h_t, r_t])
-
-M_(t+1) = clamp(
-    retention * M_t * (1 - write_amount * erase)
-    + write_amount * c_t,
-    -1,
-    1
-)
+norm(delta_t) <= max_residual_ratio * norm(h_t)
 ```
 
-The slot values are hard-clamped to `[-1, 1]`. Write rate and residual scale have explicit configuration ceilings. This gives a bounded recurrent state transition for finite inputs.
+This is enforced after the output projection, so it remains true even if projection weights grow during training.
 
-## State
+## State contract
 
 `HeraclitusState` contains:
 
-- `memory`: `(batch, memory_slots, state_size)`;
-- `usage`: `(batch, memory_slots)`;
-- `steps`: `(batch,)` valid-token counts.
+- `memory`: `(batch, memory_slots, state_size)`
+- `usage`: `(batch, memory_slots)`
+- `steps`: `(batch,)`
 
-State supports validation, detachment, cloning, device and dtype transfer, dictionary serialisation, and batch reordering.
+Memory values are clamped to `[-1, 1]`. Usage is both exponentially decayed and clamped to `max_usage`; `usage_decay=1` is rejected. State can be detached, cloned, moved, serialised, and reordered for beam search.
 
 ```python
 payload = state.as_dict()
@@ -88,91 +77,43 @@ restored = HeraclitusState.from_dict(payload)
 reordered = restored.index_select(beam_indices)
 ```
 
-Keep one state per independent sequence, user session, or generation beam. Reset state at document, user, permission, or trust-boundary changes unless persistence is explicitly intended.
+Keep one state per independent sequence, session, or generation beam. Reset state at user, document, permission, or trust-boundary changes unless persistence is deliberate.
 
-## Operational guarantees
+## Precision
 
-The release contract covers:
+Heraclitus performs its internal geometry in float32 through explicit functional projections. The host hidden dtype is preserved at the output. This supports float32, float16, and bfloat16 host streams, including when the adapter parameters have been converted to reduced precision.
 
-- causal token processing;
-- exact chunk continuation in evaluation mode for identical token order;
-- exact identity output at initialisation;
-- masked-token identity and no state advancement;
-- independent state for every batch element;
-- explicit state serialisation and beam reordering;
-- finite gradients across every active trainable parameter;
-- bounded slot values under long recurrent execution;
-- dtype preservation for host hidden states;
-- genuine multi-head memory retrieval.
+## Training semantics
 
-Dropout is stochastic in training mode, so exact chunk equivalence is only guaranteed when dropout is disabled or the adapter is in evaluation mode.
+The output projection is zero-initialised, so attaching a new adapter is an exact output no-op. Returned state is detached by default. Pass `detach_state=False` only when gradients must cross the call boundary and retained graph memory is acceptable.
 
-## Diagnostics
+All auxiliary losses exclude masked positions. Padding values therefore cannot change write-energy or residual-energy regularisation.
 
-Each forward pass reports:
+## Generation
 
-- `read_entropy`: concentration of memory retrieval;
-- `write_entropy`: concentration of slot allocation;
-- `write_rate`: mean gated write magnitude;
-- `residual_ratio`: adapter correction relative to host activation norm;
-- `memory_rms`: recurrent-state energy;
-- `effective_slots`: entropy-derived slot utilisation;
-- `maximum_slot_norm`: largest slot norm.
-
-These values are observability signals, not task-quality scores. Interpret them alongside validation loss, recall accuracy, latency, and ablation results.
-
-## Training
-
-The output projection is zero-initialised, so attaching Heraclitus does not alter the host model before training. The output projection learns first; the complete memory path receives task gradients once it becomes active. Auxiliary losses provide bounded pressure on slot balance, write energy, and residual energy.
+For one-token decoding, use `forward_step`:
 
 ```python
-result = adapter.forward_with_state(hidden, detach_state=False)
-loss = task_loss + result.regularization_loss(
-    usage_weight=1e-4,
-    write_weight=1e-4,
-    residual_weight=1e-4,
-)
-loss.backward()
-```
-
-For truncated backpropagation through time, pass the returned detached state into the next chunk. Set `detach_state=False` only when gradients must cross the chunk boundary and the retained graph fits the available memory.
-
-## Transformer integration
-
-Attach Heraclitus after a transformer block or after the final block:
-
-```python
-hidden = transformer_block(hidden, attention_mask=attention_mask)
-result = adapter.forward_with_state(
-    hidden,
-    state=session_state,
-    attention_mask=attention_mask,
-)
-hidden = result.hidden_states
+result = adapter.forward_step(hidden_t, state=session_state)
+hidden_t = result.hidden_states[:, 0]
 session_state = result.state
 ```
 
-For generation:
+For chunked prefill, use `forward_with_state`. The current reference implementation uses an explicit causal token loop. Benchmark it on the intended host and workload before deployment.
 
-1. maintain state beside the model KV cache;
-2. reorder state whenever beams are reordered;
-3. discard or reset state when the sequence ownership or trust boundary changes;
-4. persist state only through an authenticated, encrypted session store.
+## Diagnostics
 
-Heraclitus complements a transformer context window by carrying a learned bounded summary after earlier tokens are removed. It is not lossless token storage and should not replace exact retrieval when verbatim evidence is required.
+Each pass reports:
 
-## Security and privacy
+- read and write entropy
+- mean write rate
+- aggregate residual ratio
+- maximum per-token residual ratio
+- memory RMS and maximum slot norm
+- effective slot utilisation
+- maximum usage value
 
-A recurrent state may encode sensitive or adversarial information even when it is not human-readable.
-
-Treat every state object as derived user data:
-
-- isolate it by user and sequence;
-- encrypt it in transit and at rest;
-- expire it with the session;
-- never reuse it across tenants;
-- reset it after untrusted-document or permission-boundary transitions;
-- do not treat a learned erase operation as a guaranteed deletion mechanism.
+These are observability signals, not quality scores.
 
 ## Validation
 
@@ -180,28 +121,33 @@ Treat every state object as derived user data:
 ruff check .
 mypy heraclitus
 pytest --cov=heraclitus --cov-report=term-missing
+python examples/basic_usage.py
+python examples/benchmark_adapter.py --sequence-length 32 --iterations 2
 python -m build
 python -m twine check dist/*
 ```
 
-The test suite exercises no-op initialisation, parameter immutability, complete active gradient flow, causality, chunk equivalence, masking, all-masked transitions, batch isolation, state round trips, beam reordering, multi-head execution, half precision, long-horizon boundedness, diagnostics, parameter counting, and invalid inputs.
+The suite covers exact no-op initialisation, complete active gradient flow, causality, chunk equivalence, masking, padding-invariant auxiliary losses, batch isolation, state round trips, beam reordering, sparse writes, retrieved-state-conditioned candidates, strict residual bounds, reduced-precision modules, bounded long-horizon memory and usage, diagnostics, and invalid inputs.
 
 ## Evaluation standard
 
-A memory adapter should be judged against matched-cost baselines, not against its own diagnostics. Suitable evaluations include delayed copy, associative recall, passkey retrieval after source tokens leave the attention window, streaming language modelling, interference tests, and latency measurement against a GRU, LSTM, single-vector recurrence, and no-memory adapter.
+Judge Heraclitus against matched-cost baselines, including no memory, a single recurrent vector, GRU, LSTM, and recurrent memory-token adapters. Report task accuracy or perplexity, state bytes, throughput, peak accelerator memory, long-length generalisation, and ablations for slot count, top-k allocation, retention, usage pressure, and residual bounds.
 
-Report at minimum:
+Suitable tasks include delayed copy, associative recall, passkey retrieval after source tokens leave the attention window, streaming language modelling, and interference tests. A runnable delayed-copy harness is included:
 
-- task accuracy or perplexity;
-- recurrent state bytes per sequence;
-- training and inference tokens per second;
-- peak accelerator memory;
-- performance beyond the training sequence length;
-- ablations for novelty, usage, retention, slot count, and regularisation.
+```bash
+python examples/evaluate_delayed_copy.py --steps 500 --delay 32
+```
 
-## Scope
+The script reports adapter, no-memory, and chance accuracy. Its output is a local diagnostic, not a repository-level performance claim.
 
-Heraclitus is learned recurrent compression. Its fixed-size state can preserve task-relevant sufficient statistics, but it cannot losslessly retain an arbitrary history. Use external retrieval or retained token context for exact quotations, exhaustive provenance, or unbounded collections of independent facts.
+## Limits
+
+Heraclitus is learned fixed-capacity compression. It cannot losslessly retain arbitrary history, guarantee exact quotations, or replace external retrieval for exhaustive evidence. Its token-sequential reference implementation may also be unsuitable for high-throughput prefill without compilation or a fused scan.
+
+## Security and privacy
+
+Treat recurrent state as derived user data. Isolate it by sequence and tenant, encrypt it in transit and at rest, expire it with the session, and reset it across trust boundaries. A learned erase operation is not guaranteed deletion.
 
 ## License
 
