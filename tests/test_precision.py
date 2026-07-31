@@ -27,5 +27,5 @@ def test_returned_reduced_precision_residual_is_strictly_bounded(
     actual_delta = result.hidden_states.float() - hidden.float()
     actual_ratio = actual_delta.norm(dim=-1) / hidden.float().norm(dim=-1)
 
-    assert float(actual_ratio.max()) <= maximum_ratio
-    assert float(result.diagnostics.maximum_residual_ratio) <= maximum_ratio
+    assert float(actual_ratio.max().detach()) <= maximum_ratio
+    assert float(result.diagnostics.maximum_residual_ratio.detach()) <= maximum_ratio
